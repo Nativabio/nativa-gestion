@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Entornos y secretos
+.env
+.env.*
+!.env.example
+
+# Archivos locales de prueba o limpieza
+test_db.py
+reset_formula_items.py
+reset_formulas.py
+
+# Editor / sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
