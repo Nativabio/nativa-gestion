@@ -1,10 +1,17 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import joinedload
 from sqlalchemy import text
 
 from datetime import datetime
+import base64
+import hashlib
+import hmac
+import json
+import os
+import time
 from uuid import uuid4
 
 from database import SessionLocal, Base, engine
@@ -818,29 +825,300 @@ initialize_existing_lot_balances()
 
 app = FastAPI(
     title="Nativa ERP",
-    version="0.2"
+    version="0.3"
 )
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
+# ================= AUTENTICACIÓN =================
+
+ADMIN_USERNAME = os.getenv(
+    "ADMIN_USERNAME",
+    ""
+).strip()
+
+ADMIN_PASSWORD = os.getenv(
+    "ADMIN_PASSWORD",
+    ""
+)
+
+AUTH_SECRET = os.getenv(
+    "AUTH_SECRET",
+    ""
+)
+
+AUTH_TOKEN_HOURS = int(
+    os.getenv(
+        "AUTH_TOKEN_HOURS",
+        "12"
+    )
+)
+
+if not ADMIN_USERNAME:
+
+    raise RuntimeError(
+        "Falta configurar ADMIN_USERNAME."
+    )
+
+if not ADMIN_PASSWORD:
+
+    raise RuntimeError(
+        "Falta configurar ADMIN_PASSWORD."
+    )
+
+if len(AUTH_SECRET) < 32:
+
+    raise RuntimeError(
+        "AUTH_SECRET debe tener al menos 32 caracteres."
+    )
+
+
+def encode_token_part(
+    value
+):
+
+    return (
+        base64.urlsafe_b64encode(
+            value
+        )
+        .rstrip(b"=")
+        .decode("utf-8")
+    )
+
+
+def decode_token_part(
+    value
+):
+
+    padding = (
+        "="
+        *
+        (
+            -len(value)
+            %
+            4
+        )
+    )
+
+    return base64.urlsafe_b64decode(
+        value
+        +
+        padding
+    )
+
+
+def create_access_token(
+    username
+):
+
+    now = int(
+        time.time()
+    )
+
+    payload = {
+
+        "sub":
+        username,
+
+        "iat":
+        now,
+
+        "exp":
+        now
+        +
+        (
+            AUTH_TOKEN_HOURS
+            *
+            60
+            *
+            60
+        )
+
+    }
+
+    payload_part = encode_token_part(
+        json.dumps(
+            payload,
+            separators=(",", ":")
+        ).encode("utf-8")
+    )
+
+    signature = hmac.new(
+        AUTH_SECRET.encode("utf-8"),
+        payload_part.encode("utf-8"),
+        hashlib.sha256
+    ).digest()
+
+    return (
+        payload_part
+        +
+        "."
+        +
+        encode_token_part(
+            signature
+        )
+    )
+
+
+def verify_access_token(
+    token
+):
+
+    try:
+
+        payload_part, signature_part = (
+            token.split(
+                ".",
+                1
+            )
+        )
+
+        expected_signature = hmac.new(
+            AUTH_SECRET.encode("utf-8"),
+            payload_part.encode("utf-8"),
+            hashlib.sha256
+        ).digest()
+
+        received_signature = (
+            decode_token_part(
+                signature_part
+            )
+        )
+
+        if not hmac.compare_digest(
+            expected_signature,
+            received_signature
+        ):
+
+            return None
+
+        payload = json.loads(
+            decode_token_part(
+                payload_part
+            ).decode("utf-8")
+        )
+
+        if int(
+            payload.get(
+                "exp",
+                0
+            )
+        ) < int(
+            time.time()
+        ):
+
+            return None
+
+        if payload.get(
+            "sub"
+        ) != ADMIN_USERNAME:
+
+            return None
+
+        return payload
+
+    except Exception:
+
+        return None
+
+
+PUBLIC_PATHS = {
+    "/",
+    "/auth/login",
+    "/health"
+}
+
+
+@app.middleware("http")
+async def protect_api(
+    request: Request,
+    call_next
+):
+
+    if (
+        request.method == "OPTIONS"
+        or
+        request.url.path in PUBLIC_PATHS
+    ):
+
+        return await call_next(
+            request
+        )
+
+    authorization = (
+        request.headers.get(
+            "Authorization",
+            ""
+        )
+    )
+
+    if not authorization.startswith(
+        "Bearer "
+    ):
+
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error":
+                "Sesión no iniciada"
+            }
+        )
+
+    token = authorization[
+        len("Bearer "):
+    ].strip()
+
+    payload = verify_access_token(
+        token
+    )
+
+    if not payload:
+
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error":
+                "La sesión venció o no es válida"
+            }
+        )
+
+    request.state.username = (
+        payload["sub"]
+    )
+
+    return await call_next(
+        request
+    )
+
+
+cors_origins_value = os.getenv(
+    "CORS_ORIGINS",
+    (
+        "http://localhost:5173,"
         "http://127.0.0.1:5173"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    )
 )
 
-# ================= CORS =================
+cors_origins = [
+
+    origin.strip()
+
+    for origin
+    in cors_origins_value.split(",")
+
+    if origin.strip()
+
+]
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type"
+    ],
 )
 
 
@@ -1098,6 +1376,96 @@ def next_purchase_number(
     }
 
 
+# ================= ACCESO =================
+
+@app.post("/auth/login")
+def login(
+    data: dict
+):
+
+    username = str(
+        data.get(
+            "username",
+            ""
+        )
+    ).strip()
+
+    password = str(
+        data.get(
+            "password",
+            ""
+        )
+    )
+
+    valid_username = (
+        hmac.compare_digest(
+            username,
+            ADMIN_USERNAME
+        )
+    )
+
+    valid_password = (
+        hmac.compare_digest(
+            password,
+            ADMIN_PASSWORD
+        )
+    )
+
+    if not (
+        valid_username
+        and
+        valid_password
+    ):
+
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error":
+                "Usuario o contraseña incorrectos"
+            }
+        )
+
+    token = create_access_token(
+        ADMIN_USERNAME
+    )
+
+    return {
+
+        "access_token":
+        token,
+
+        "token_type":
+        "bearer",
+
+        "username":
+        ADMIN_USERNAME,
+
+        "expires_in_hours":
+        AUTH_TOKEN_HOURS
+
+    }
+
+
+@app.get("/auth/me")
+def authenticated_user(
+    request: Request
+):
+
+    return {
+        "username":
+        request.state.username
+    }
+
+
+@app.post("/auth/logout")
+def logout():
+
+    return {
+        "message":
+        "Sesión cerrada"
+    }
+
+
 # ================= HOME =================
 
 @app.get("/")
@@ -1105,8 +1473,18 @@ def home():
 
     return {
         "empresa": "Nativa ERP",
-        "version": "0.2",
-        "estado": "operativo"
+        "version": "0.3",
+        "estado": "operativo",
+        "acceso": "protegido"
+    }
+
+
+@app.get("/health")
+def health():
+
+    return {
+        "status":
+        "ok"
     }
 
 
