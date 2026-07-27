@@ -147,72 +147,6 @@ with engine.connect() as conn:
 
     conn.execute(
         text(
-            """
-            CREATE TABLE IF NOT EXISTS lot_materials (
-
-                id SERIAL PRIMARY KEY,
-
-                lot_id INTEGER REFERENCES lots(id) ON DELETE CASCADE,
-
-                raw_material_id INTEGER REFERENCES raw_materials(id),
-
-                quantity FLOAT DEFAULT 0,
-
-                unit_cost FLOAT DEFAULT 0,
-
-                subtotal_cost FLOAT DEFAULT 0,
-
-                source VARCHAR DEFAULT 'REAL'
-
-            )
-            """
-        )
-    )
-
-    conn.execute(
-        text(
-            "ALTER TABLE lot_materials "
-            "ADD COLUMN IF NOT EXISTS source VARCHAR DEFAULT 'REAL'"
-        )
-    )
-
-    # Los lotes anteriores no guardaban el detalle real de materias primas.
-    # Se completa una estimación usando la fórmula actual para que puedan
-    # verse en el historial y eliminarse con una advertencia clara.
-    conn.execute(
-        text(
-            """
-            INSERT INTO lot_materials (
-                lot_id,
-                raw_material_id,
-                quantity,
-                unit_cost,
-                subtotal_cost,
-                source
-            )
-            SELECT
-                lots.id,
-                formula_items.raw_material_id,
-                formula_items.quantity,
-                COALESCE(raw_materials.cost, 0),
-                formula_items.quantity * COALESCE(raw_materials.cost, 0),
-                'FORMULA_ESTIMATE'
-            FROM lots
-            JOIN formula_items
-                ON formula_items.formula_id = lots.formula_id
-            JOIN raw_materials
-                ON raw_materials.id = formula_items.raw_material_id
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM lot_materials
-                WHERE lot_materials.lot_id = lots.id
-            )
-            """
-        )
-    )
-
-    conn.execute(
-        text(
             "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS category VARCHAR"
         )
     )
@@ -394,13 +328,6 @@ def create_default_accounts():
         },
 
         {
-            "code": "2.1.03",
-            "name": "Tarjeta de crédito a pagar",
-            "type": "PASIVO",
-            "category": "PASIVO"
-        },
-
-        {
             "code": "4.1.01",
             "name": "Ventas",
             "type": "INGRESO",
@@ -417,13 +344,6 @@ def create_default_accounts():
         {
             "code": "5.2.01",
             "name": "Gasto de Mano de Obra",
-            "type": "GASTO",
-            "category": "GASTO"
-        },
-
-        {
-            "code": "5.3.01",
-            "name": "Materiales y gastos de producción",
             "type": "GASTO",
             "category": "GASTO"
         }
@@ -2499,10 +2419,6 @@ def get_purchases(
 
     result = []
 
-    metadata_prefix = (
-        "__NATIVA_PURCHASE_META__"
-    )
-
     for purchase in purchases:
 
         supplier_value = str(
@@ -2531,50 +2447,6 @@ def get_purchases(
                 "Sin proveedor"
             )
 
-        raw_notes = str(
-            purchase.notes or ""
-        )
-
-        metadata = {}
-
-        visible_notes = raw_notes
-
-        if raw_notes.startswith(
-            metadata_prefix
-        ):
-
-            try:
-
-                metadata = json.loads(
-                    raw_notes[
-                        len(metadata_prefix):
-                    ]
-                )
-
-                visible_notes = str(
-                    metadata.get(
-                        "notes",
-                        ""
-                    )
-                )
-
-            except Exception:
-
-                metadata = {}
-                visible_notes = raw_notes
-
-        extra_items = metadata.get(
-            "extra_items",
-            []
-        )
-
-        if not isinstance(
-            extra_items,
-            list
-        ):
-
-            extra_items = []
-
         result.append({
 
             "id":
@@ -2599,20 +2471,7 @@ def get_purchases(
             purchase.date,
 
             "notes":
-            visible_notes,
-
-            "shipping_cost":
-            float(
-                metadata.get(
-                    "shipping_cost",
-                    0
-                )
-                or
-                0
-            ),
-
-            "extra_items":
-            extra_items,
+            purchase.notes,
 
             "total":
             float(
@@ -2679,109 +2538,30 @@ def create_purchase_items(
         Purchase.id == data["purchase_id"]
     ).first()
 
+
     if not purchase:
 
         return {
             "error": "Compra no encontrada"
         }
 
-    items = data.get(
-        "items",
-        []
-    )
 
-    extra_items = data.get(
-        "extra_items",
-        []
-    )
+    total = 0
 
-    shipping_cost = max(
-        float(
-            data.get(
-                "shipping_cost",
-                0
-            )
-            or
-            0
-        ),
-        0
-    )
 
-    clean_items = []
+    for item in data["items"]:
 
-    for item in items:
-
-        quantity = float(
-            item.get(
-                "quantity",
-                0
-            )
-            or
-            0
-        )
-
-        price = float(
-            item.get(
-                "price",
-                0
-            )
-            or
-            0
-        )
-
-        if quantity <= 0 or price < 0:
-
-            continue
-
-        clean_items.append({
-            "raw_material_id":
-            item.get(
-                "raw_material_id"
-            ),
-
-            "quantity":
-            quantity,
-
-            "price":
-            price
-        })
-
-    material_base_total = sum(
-        item["price"]
-        for item in clean_items
-    )
-
-    material_total = 0
-
-    for item in clean_items:
 
         material = db.query(RawMaterial).filter(
-            RawMaterial.id
-            ==
-            item["raw_material_id"]
+            RawMaterial.id == item["raw_material_id"]
         ).first()
+
 
         if not material:
 
             continue
 
-        allocated_shipping = 0
 
-        if material_base_total > 0:
-
-            allocated_shipping = (
-                shipping_cost
-                *
-                item["price"]
-                /
-                material_base_total
-            )
-
-        final_price = (
-            item["price"]
-            +
-            allocated_shipping
-        )
 
         purchase_item = PurchaseItem(
 
@@ -2791,280 +2571,116 @@ def create_purchase_items(
 
             quantity=item["quantity"],
 
-            price=final_price
+            price=item["price"]
 
         )
+
 
         db.add(purchase_item)
 
-        material.stock = (
-            float(material.stock or 0)
-            +
-            item["quantity"]
-        )
 
-        material.cost = (
-            final_price
+
+        # ==========================
+        # ACTUALIZA STOCK
+        # ==========================
+
+        material.stock += item["quantity"]
+
+
+
+        # ==========================
+        # ACTUALIZA COSTO
+        # ==========================
+
+        unit_cost = (
+            item["price"]
             /
             item["quantity"]
         )
 
-        material_total += final_price
 
-    clean_extra_items = []
+        material.cost = unit_cost
 
-    extra_total = 0
 
-    for item in extra_items:
 
-        name = str(
-            item.get(
-                "name",
-                ""
-            )
-            or
-            ""
-        ).strip()
+        # ==========================
+        # TOTAL COMPRA
+        # ==========================
 
-        category = str(
-            item.get(
-                "category",
-                "Otro"
-            )
-            or
-            "Otro"
-        ).strip()
+        total += item["price"]
 
-        quantity = float(
-            item.get(
-                "quantity",
-                0
-            )
-            or
-            0
-        )
 
-        price = float(
-            item.get(
-                "price",
-                0
-            )
-            or
-            0
-        )
-
-        if (
-            not name
-            or
-            quantity <= 0
-            or
-            price < 0
-        ):
-
-            continue
-
-        clean_extra_items.append({
-
-            "name":
-            name,
-
-            "category":
-            category,
-
-            "quantity":
-            quantity,
-
-            "price":
-            price
-
-        })
-
-        extra_total += price
-
-    unallocated_shipping = 0
-
-    if material_base_total <= 0:
-
-        unallocated_shipping = (
-            shipping_cost
-        )
-
-    expense_total = (
-        extra_total
-        +
-        unallocated_shipping
-    )
-
-    total = (
-        material_total
-        +
-        expense_total
-    )
-
-    if total <= 0:
-
-        return {
-            "error":
-            "La compra no tiene importes válidos"
-        }
-
-    metadata = {
-
-        "shipping_cost":
-        shipping_cost,
-
-        "extra_items":
-        clean_extra_items,
-
-        "notes":
-        ""
-
-    }
-
-    purchase.notes = (
-        "__NATIVA_PURCHASE_META__"
-        +
-        json.dumps(
-            metadata,
-            ensure_ascii=False
-        )
-    )
 
     purchase.total = total
 
+
+
+    # ==========================
+    # CUENTA SEGÚN MEDIO DE PAGO
+    # ==========================
+
     if purchase.payment_method == "Banco":
 
-        payment_code = "1.1.02"
-        payment_name = "Banco"
+        cuenta_pago_codigo = "1.1.02"
+        cuenta_pago_nombre = "Banco"
 
     elif purchase.payment_method == "Mercado Pago":
 
-        payment_code = "1.1.03"
-        payment_name = "Mercado Pago"
+        cuenta_pago_codigo = "1.1.03"
+        cuenta_pago_nombre = "Mercado Pago"
 
-    elif purchase.payment_method in [
-        "Tarjeta",
-        "Tarjeta de crédito"
-    ]:
+    elif purchase.payment_method in ["Proveedores", "Cuenta corriente"]:
 
-        payment_code = "2.1.03"
-        payment_name = "Tarjeta de crédito a pagar"
-
-    elif purchase.payment_method in [
-        "Proveedores",
-        "Cuenta corriente"
-    ]:
-
-        payment_code = "2.1.01"
-        payment_name = "Proveedores"
+        cuenta_pago_codigo = "2.1.01"
+        cuenta_pago_nombre = "Proveedores"
 
     else:
 
-        payment_code = "1.1.01"
-        payment_name = "Caja"
+        cuenta_pago_codigo = "1.1.01"
+        cuenta_pago_nombre = "Caja"
 
-    group_id = str(
-        uuid4()
+
+    # ==========================
+    # ASIENTO CONTABLE COMPRA
+    # ==========================
+
+    registrar_asiento(
+
+        db,
+
+        purchase.date,
+
+        f"Compra {purchase.number}",
+
+        "1.2.01",
+
+        "Materia Prima",
+
+        cuenta_pago_codigo,
+
+        cuenta_pago_nombre,
+
+        total,
+
+        origin="COMPRA",
+
+        origin_id=purchase.id
+
     )
 
-    if material_total > 0:
 
-        db.add(
-            JournalEntry(
-
-                date=purchase.date,
-
-                concept=(
-                    f"Compra {purchase.number}"
-                ),
-
-                account_code="1.2.01",
-
-                account_name="Materia Prima",
-
-                debit=material_total,
-
-                credit=0,
-
-                entry_group=group_id,
-
-                origin="COMPRA",
-
-                origin_id=purchase.id
-
-            )
-        )
-
-    if expense_total > 0:
-
-        db.add(
-            JournalEntry(
-
-                date=purchase.date,
-
-                concept=(
-                    f"Compra {purchase.number}"
-                ),
-
-                account_code="5.3.01",
-
-                account_name=(
-                    "Materiales y gastos de producción"
-                ),
-
-                debit=expense_total,
-
-                credit=0,
-
-                entry_group=group_id,
-
-                origin="COMPRA",
-
-                origin_id=purchase.id
-
-            )
-        )
-
-    db.add(
-        JournalEntry(
-
-            date=purchase.date,
-
-            concept=(
-                f"Compra {purchase.number}"
-            ),
-
-            account_code=payment_code,
-
-            account_name=payment_name,
-
-            debit=0,
-
-            credit=total,
-
-            entry_group=group_id,
-
-            origin="COMPRA",
-
-            origin_id=purchase.id
-
-        )
-    )
 
     db.commit()
+
+
 
     return {
 
         "message":
-        "Compra completa guardada y contabilizada",
-
-        "total":
-        total
+        "Compra completa guardada y contabilizada"
 
     }
-
-
-# ================= COMPRAS ITEMS =================
+    # ================= COMPRAS ITEMS =================
 
 @app.post("/purchase-item/{purchase_id}/{product_id}/{qty}")
 def add_purchase_item(
@@ -4644,14 +4260,7 @@ def dashboard(
 def get_formulas(
     db: Session = Depends(get_db)
 ):
-
-    return (
-        db.query(Formula)
-        .order_by(
-            Formula.name.asc()
-        )
-        .all()
-    )
+    return db.query(Formula).all()
 
 
 @app.post("/formulas")
@@ -4731,24 +4340,9 @@ def get_formula_items(
     db: Session = Depends(get_db)
 ):
 
-    items = (
-        db.query(FormulaItem)
-        .join(
-            RawMaterial,
-            FormulaItem.raw_material_id
-            ==
-            RawMaterial.id
-        )
-        .filter(
-            FormulaItem.formula_id
-            ==
-            formula_id
-        )
-        .order_by(
-            RawMaterial.name.asc()
-        )
-        .all()
-    )
+    items = db.query(FormulaItem).filter(
+        FormulaItem.formula_id == formula_id
+    ).all()
 
 
     resultado = []
@@ -4783,481 +4377,6 @@ def get_formula_items(
     return resultado
 
 # ================= LOTES =================
-
-@app.get("/lots")
-def get_lots(
-    db: Session = Depends(get_db)
-):
-
-    lots = (
-        db.query(Lot)
-        .order_by(
-            Lot.production_date.desc(),
-            Lot.id.desc()
-        )
-        .all()
-    )
-
-    formulas = db.query(Formula).all()
-    products = db.query(Product).all()
-
-    formula_by_id = {
-        formula.id:
-        formula
-        for formula in formulas
-    }
-
-    product_name_by_id = {
-        product.id:
-        product.name
-        for product in products
-    }
-
-    material_rows = db.execute(
-        text(
-            """
-            SELECT
-                lot_materials.lot_id,
-                lot_materials.raw_material_id,
-                raw_materials.name,
-                raw_materials.unit,
-                lot_materials.quantity,
-                lot_materials.unit_cost,
-                lot_materials.subtotal_cost,
-                lot_materials.source
-            FROM lot_materials
-            LEFT JOIN raw_materials
-                ON raw_materials.id = lot_materials.raw_material_id
-            ORDER BY
-                lot_materials.lot_id,
-                raw_materials.name
-            """
-        )
-    ).mappings().all()
-
-    materials_by_lot = {}
-
-    for row in material_rows:
-
-        materials_by_lot.setdefault(
-            row["lot_id"],
-            []
-        ).append({
-            "raw_material_id":
-            row["raw_material_id"],
-
-            "name":
-            row["name"]
-            or
-            "Materia prima eliminada",
-
-            "unit":
-            row["unit"]
-            or
-            "",
-
-            "quantity":
-            float(row["quantity"] or 0),
-
-            "unit_cost":
-            float(row["unit_cost"] or 0),
-
-            "subtotal_cost":
-            float(row["subtotal_cost"] or 0),
-
-            "source":
-            row["source"]
-            or
-            "REAL"
-        })
-
-    allocation_lot_ids = {
-        row[0]
-        for row in (
-            db.query(
-                SaleLotAllocation.lot_id
-            )
-            .distinct()
-            .all()
-        )
-    }
-
-    result = []
-
-    for lot in lots:
-
-        formula = formula_by_id.get(
-            lot.formula_id
-        )
-
-        product_id = (
-            formula.output_product_id
-            if formula
-            else
-            None
-        )
-
-        materials = materials_by_lot.get(
-            lot.id,
-            []
-        )
-
-        has_estimated_materials = any(
-            material["source"]
-            ==
-            "FORMULA_ESTIMATE"
-            for material in materials
-        )
-
-        units_produced = float(
-            lot.units_produced or 0
-        )
-
-        remaining_units = float(
-            lot.remaining_units
-            if lot.remaining_units is not None
-            else units_produced
-        )
-
-        has_sales = (
-            lot.id
-            in
-            allocation_lot_ids
-        )
-
-        can_delete = (
-            not has_sales
-            and
-            abs(
-                remaining_units
-                -
-                units_produced
-            )
-            <
-            0.000001
-        )
-
-        result.append({
-            "id":
-            lot.id,
-
-            "lot_number":
-            lot.lot_number,
-
-            "formula_id":
-            lot.formula_id,
-
-            "formula_name":
-            formula.name
-            if formula
-            else
-            "Fórmula eliminada",
-
-            "product_id":
-            product_id,
-
-            "product_name":
-            product_name_by_id.get(
-                product_id,
-                "Producto sin identificar"
-            ),
-
-            "production_date":
-            str(lot.production_date or "")[:10],
-
-            "expiration_date":
-            str(lot.expiration_date or "")[:10],
-
-            "units_produced":
-            units_produced,
-
-            "remaining_units":
-            remaining_units,
-
-            "real_labor_hours":
-            float(lot.real_labor_hours or 0),
-
-            "material_cost":
-            float(lot.material_cost or 0),
-
-            "labor_cost":
-            float(lot.labor_cost or 0),
-
-            "total_cost":
-            float(lot.total_cost or 0),
-
-            "unit_cost":
-            float(lot.unit_cost or 0),
-
-            "notes":
-            lot.notes or "",
-
-            "status":
-            lot.status
-            or
-            (
-                "Disponible"
-                if remaining_units > 0
-                else
-                "Agotado"
-            ),
-
-            "materials":
-            materials,
-
-            "material_history_source":
-            (
-                "FORMULA_ESTIMATE"
-                if has_estimated_materials
-                else
-                "REAL"
-            ),
-
-            "has_sales":
-            has_sales,
-
-            "can_delete":
-            can_delete,
-
-            "delete_block_reason":
-            (
-                "El lote ya fue utilizado en una venta."
-                if has_sales
-                else
-                (
-                    "El lote ya tiene unidades consumidas o ajustadas."
-                    if not can_delete
-                    else
-                    ""
-                )
-            )
-        })
-
-    return result
-
-
-@app.delete("/lots/{lot_id}")
-def delete_lot(
-    lot_id: int,
-    db: Session = Depends(get_db)
-):
-
-    lot = db.query(Lot).filter(
-        Lot.id == lot_id
-    ).first()
-
-    if not lot:
-
-        return {
-            "error":
-            "Lote no encontrado"
-        }
-
-    allocations = (
-        db.query(SaleLotAllocation)
-        .filter(
-            SaleLotAllocation.lot_id
-            ==
-            lot.id
-        )
-        .count()
-    )
-
-    units_produced = float(
-        lot.units_produced or 0
-    )
-
-    remaining_units = float(
-        lot.remaining_units
-        if lot.remaining_units is not None
-        else units_produced
-    )
-
-    if (
-        allocations > 0
-        or
-        abs(
-            remaining_units
-            -
-            units_produced
-        )
-        >
-        0.000001
-    ):
-
-        return {
-            "error":
-            (
-                "No se puede eliminar este lote porque "
-                "ya fue utilizado total o parcialmente en ventas."
-            )
-        }
-
-    formula = db.query(Formula).filter(
-        Formula.id == lot.formula_id
-    ).first()
-
-    product = None
-
-    if formula:
-
-        product = db.query(Product).filter(
-            Product.id
-            ==
-            formula.output_product_id
-        ).first()
-
-    if not product:
-
-        return {
-            "error":
-            "No se encontró el producto terminado asociado al lote"
-        }
-
-    if (
-        float(product.stock or 0)
-        +
-        0.000001
-        <
-        units_produced
-    ):
-
-        return {
-            "error":
-            (
-                "No se puede eliminar el lote porque el stock actual "
-                "del producto terminado es menor que las unidades del lote."
-            )
-        }
-
-    material_rows = db.execute(
-        text(
-            """
-            SELECT
-                raw_material_id,
-                quantity,
-                source
-            FROM lot_materials
-            WHERE lot_id = :lot_id
-            """
-        ),
-        {
-            "lot_id":
-            lot.id
-        }
-    ).mappings().all()
-
-    if not material_rows:
-
-        return {
-            "error":
-            (
-                "Este lote no tiene guardado el detalle de materias primas "
-                "y no puede eliminarse de forma segura."
-            )
-        }
-
-    used_estimated_history = any(
-        row["source"]
-        ==
-        "FORMULA_ESTIMATE"
-        for row in material_rows
-    )
-
-    try:
-
-        for row in material_rows:
-
-            raw = db.query(RawMaterial).filter(
-                RawMaterial.id
-                ==
-                row["raw_material_id"]
-            ).first()
-
-            if raw:
-
-                raw.stock = (
-                    float(raw.stock or 0)
-                    +
-                    float(row["quantity"] or 0)
-                )
-
-        product.stock = (
-            float(product.stock or 0)
-            -
-            units_produced
-        )
-
-        if product.stock < 0.000001:
-
-            product.stock = max(
-                float(product.stock or 0),
-                0
-            )
-
-        db.query(JournalEntry).filter(
-            JournalEntry.origin
-            ==
-            "PRODUCCION",
-            JournalEntry.origin_id
-            ==
-            lot.id
-        ).delete(
-            synchronize_session=False
-        )
-
-        db.query(JournalEntry).filter(
-            JournalEntry.origin_id.is_(None),
-            JournalEntry.concept
-            ==
-            f"Producción lote {lot.lot_number}"
-        ).delete(
-            synchronize_session=False
-        )
-
-        db.execute(
-            text(
-                "DELETE FROM lot_materials WHERE lot_id = :lot_id"
-            ),
-            {
-                "lot_id":
-                lot.id
-            }
-        )
-
-        db.delete(lot)
-
-        db.commit()
-
-        return {
-            "message":
-            f"Lote {lot.lot_number} eliminado correctamente",
-
-            "materials_restored":
-            True,
-
-            "used_estimated_history":
-            used_estimated_history,
-
-            "warning":
-            (
-                "Las materias primas se repusieron según la fórmula actual "
-                "porque este lote es anterior al historial detallado."
-                if used_estimated_history
-                else
-                ""
-            )
-        }
-
-    except Exception as error:
-
-        db.rollback()
-
-        return {
-            "error":
-            f"No se pudo eliminar el lote: {error}"
-        }
-
 
 @app.post("/lots")
 def create_lot(
@@ -5349,8 +4468,7 @@ def create_lot(
         materials_to_discount.append(
             (
                 raw,
-                quantity_used,
-                unit_material_cost
+                quantity_used
             )
         )
 
@@ -5456,57 +4574,12 @@ def create_lot(
         # DESCONTAR MATERIAS PRIMAS
         # ==========================
 
-        for (
-            raw,
-            quantity_used,
-            unit_material_cost
-        ) in materials_to_discount:
+        for raw, quantity_used in materials_to_discount:
 
             raw.stock = (
                 float(raw.stock or 0)
                 -
                 quantity_used
-            )
-
-            db.execute(
-                text(
-                    """
-                    INSERT INTO lot_materials (
-                        lot_id,
-                        raw_material_id,
-                        quantity,
-                        unit_cost,
-                        subtotal_cost,
-                        source
-                    )
-                    VALUES (
-                        :lot_id,
-                        :raw_material_id,
-                        :quantity,
-                        :unit_cost,
-                        :subtotal_cost,
-                        'REAL'
-                    )
-                    """
-                ),
-                {
-                    "lot_id":
-                    item.id,
-
-                    "raw_material_id":
-                    raw.id,
-
-                    "quantity":
-                    quantity_used,
-
-                    "unit_cost":
-                    unit_material_cost,
-
-                    "subtotal_cost":
-                    quantity_used
-                    *
-                    unit_material_cost
-                }
             )
 
         # ==========================
@@ -5610,24 +4683,9 @@ def get_formula_items(
 
     return (
         db.query(FormulaItem)
-        .options(
-            joinedload(
-                FormulaItem.raw_material
-            )
-        )
-        .join(
-            RawMaterial,
-            FormulaItem.raw_material_id
-            ==
-            RawMaterial.id
-        )
+        .options(joinedload(FormulaItem.raw_material))
         .filter(
-            FormulaItem.formula_id
-            ==
-            formula_id
-        )
-        .order_by(
-            RawMaterial.name.asc()
+            FormulaItem.formula_id == formula_id
         )
         .all()
     )
@@ -5686,17 +4744,13 @@ def formula_cost(
         if not material:
             continue
 
-        # RawMaterial.cost ya guarda el costo por unidad.
-        # No debe volver a dividirse por el stock disponible.
-        costo_unitario = float(
-            material.cost or 0
+        costo_unitario = (
+            material.cost / material.stock
+            if material.stock > 0
+            else 0
         )
 
-        costo_item = (
-            costo_unitario
-            *
-            float(item.quantity or 0)
-        )
+        costo_item = costo_unitario * item.quantity
 
         total_materiales += costo_item
 
@@ -5750,14 +4804,7 @@ def formula_cost(
 def get_raw_materials(
     db: Session = Depends(get_db)
 ):
-
-    return (
-        db.query(RawMaterial)
-        .order_by(
-            RawMaterial.name.asc()
-        )
-        .all()
-    )
+    return db.query(RawMaterial).all()
 
 
 @app.post("/raw-materials")
