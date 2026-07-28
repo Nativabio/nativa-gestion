@@ -123,6 +123,90 @@ class SaleLotAllocation(Base):
     subtotal_cost = Column(Float, default=0)
 
 
+# ================= BAJAS DE STOCK =================
+
+class StockMovement(Base):
+    __tablename__ = "stock_movements"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    number = Column(String, unique=True, index=True)
+
+    date = Column(String)
+
+    reason = Column(String)
+
+    notes = Column(String, default="")
+
+    total_cost = Column(Float, default=0)
+
+    items = relationship(
+        "StockMovementItem",
+        back_populates="movement",
+        cascade="all, delete-orphan"
+    )
+
+
+class StockMovementItem(Base):
+    __tablename__ = "stock_movement_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    stock_movement_id = Column(
+        Integer,
+        ForeignKey("stock_movements.id", ondelete="CASCADE")
+    )
+
+    product_id = Column(
+        Integer,
+        ForeignKey("products.id")
+    )
+
+    quantity = Column(Float, default=0)
+
+    cost_total = Column(Float, default=0)
+
+    movement = relationship(
+        "StockMovement",
+        back_populates="items"
+    )
+
+    product = relationship("Product")
+
+    allocations = relationship(
+        "StockMovementLotAllocation",
+        back_populates="movement_item",
+        cascade="all, delete-orphan"
+    )
+
+
+class StockMovementLotAllocation(Base):
+    __tablename__ = "stock_movement_lot_allocations"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    stock_movement_item_id = Column(
+        Integer,
+        ForeignKey("stock_movement_items.id", ondelete="CASCADE")
+    )
+
+    lot_id = Column(
+        Integer,
+        ForeignKey("lots.id")
+    )
+
+    quantity = Column(Float, default=0)
+
+    unit_cost = Column(Float, default=0)
+
+    subtotal_cost = Column(Float, default=0)
+
+    movement_item = relationship(
+        "StockMovementItem",
+        back_populates="allocations"
+    )
+
+
 # ================= COMPRAS =================
 
 class Purchase(Base):
@@ -286,6 +370,8 @@ class Formula(Base):
     labor_hours = Column(Float, default=0)
 
     units_produced = Column(Float, default=1)
+
+    margin_percent = Column(Float, default=40)
 
     notes = Column(String, default="")
 
