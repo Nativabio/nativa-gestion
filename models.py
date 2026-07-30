@@ -72,9 +72,21 @@ class Sale(Base):
 
     total = Column(Float, default=0)
 
+    amount_paid = Column(Float, default=0)
+
+    balance = Column(Float, default=0)
+
+    payment_status = Column(String, default="PAGADA")
+
     items = relationship(
         "SaleItem",
         back_populates="sale"
+    )
+
+    payments = relationship(
+        "SalePayment",
+        back_populates="sale",
+        cascade="all, delete-orphan"
     )
 
 
@@ -98,6 +110,32 @@ class SaleItem(Base):
     sale = relationship(
         "Sale",
         back_populates="items"
+    )
+
+
+class SalePayment(Base):
+    __tablename__ = "sale_payments"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    number = Column(String, unique=True, index=True)
+
+    sale_id = Column(
+        Integer,
+        ForeignKey("sales.id", ondelete="CASCADE")
+    )
+
+    date = Column(String)
+
+    payment_method = Column(String)
+
+    amount = Column(Float, default=0)
+
+    notes = Column(String, default="")
+
+    sale = relationship(
+        "Sale",
+        back_populates="payments"
     )
 
 
@@ -135,6 +173,8 @@ class StockMovement(Base):
     date = Column(String)
 
     reason = Column(String)
+
+    movement_type = Column(String, default="OUT")
 
     notes = Column(String, default="")
 
@@ -365,6 +405,13 @@ class Formula(Base):
 
     output_product_id = Column(Integer)
 
+    output_raw_material_id = Column(
+        Integer,
+        ForeignKey("raw_materials.id")
+    )
+
+    output_type = Column(String, default="PRODUCT")
+
     batch_size = Column(Float, default=1)
 
     labor_hours = Column(Float, default=0)
@@ -405,9 +452,11 @@ class RawMaterial(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    code = Column(String, unique=True, index=True)
+    code = Column(String, unique=True, index=True, nullable=True)
 
     name = Column(String)
+
+    is_intermediate = Column(Integer, default=0)
 
     category = Column(String)
 
@@ -446,6 +495,15 @@ class Lot(Base):
 
     formula = relationship("Formula")
 
+    output_type = Column(String, default="PRODUCT")
+
+    output_raw_material_id = Column(
+        Integer,
+        ForeignKey("raw_materials.id")
+    )
+
+    origin = Column(String, default="PRODUCTION")
+
     production_date = Column(Date)
 
     expiration_date = Column(Date)
@@ -469,3 +527,31 @@ class Lot(Base):
     notes = Column(String)
 
     status = Column(String, default="Disponible")
+
+# ================= TRAZABILIDAD DE INTERMEDIOS =================
+
+class LotMaterialSourceAllocation(Base):
+    __tablename__ = "lot_material_source_allocations"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    consumer_lot_id = Column(
+        Integer,
+        ForeignKey("lots.id", ondelete="CASCADE")
+    )
+
+    raw_material_id = Column(
+        Integer,
+        ForeignKey("raw_materials.id")
+    )
+
+    source_lot_id = Column(
+        Integer,
+        ForeignKey("lots.id")
+    )
+
+    quantity = Column(Float, default=0)
+
+    unit_cost = Column(Float, default=0)
+
+    subtotal_cost = Column(Float, default=0)

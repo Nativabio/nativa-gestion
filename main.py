@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm import joinedload
 from sqlalchemy import text
 
-from datetime import datetime
+from datetime import datetime, date
 import base64
 import hashlib
 import hmac
@@ -22,6 +22,7 @@ from models import (
     Product,
     Sale,
     SaleItem,
+    SalePayment,
     SaleLotAllocation,
     StockMovement,
     StockMovementItem,
@@ -38,7 +39,8 @@ from models import (
     Account,
     JournalEntry,
     Journal,
-    JournalDetail
+    JournalDetail,
+    LotMaterialSourceAllocation
 )
 from schemas import (
     ProductCreate,
@@ -80,6 +82,40 @@ with engine.connect() as conn:
 
     conn.execute(
         text(
+            "ALTER TABLE sales ADD COLUMN IF NOT EXISTS amount_paid FLOAT DEFAULT 0"
+        )
+    )
+
+    conn.execute(
+        text(
+            "ALTER TABLE sales ADD COLUMN IF NOT EXISTS balance FLOAT DEFAULT 0"
+        )
+    )
+
+    conn.execute(
+        text(
+            "ALTER TABLE sales ADD COLUMN IF NOT EXISTS payment_status VARCHAR DEFAULT 'PAGADA'"
+        )
+    )
+
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS sale_payments (
+                id SERIAL PRIMARY KEY,
+                number VARCHAR UNIQUE,
+                sale_id INTEGER REFERENCES sales(id) ON DELETE CASCADE,
+                date VARCHAR,
+                payment_method VARCHAR,
+                amount FLOAT DEFAULT 0,
+                notes VARCHAR DEFAULT ''
+            )
+            """
+        )
+    )
+
+    conn.execute(
+        text(
             "ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_method VARCHAR"
         )
     )
@@ -87,6 +123,24 @@ with engine.connect() as conn:
     conn.execute(
         text(
             "ALTER TABLE formulas ADD COLUMN IF NOT EXISTS margin_percent FLOAT DEFAULT 40"
+        )
+    )
+
+    conn.execute(
+        text(
+            "ALTER TABLE formulas ADD COLUMN IF NOT EXISTS output_raw_material_id INTEGER"
+        )
+    )
+
+    conn.execute(
+        text(
+            "ALTER TABLE formulas ADD COLUMN IF NOT EXISTS output_type VARCHAR DEFAULT 'PRODUCT'"
+        )
+    )
+
+    conn.execute(
+        text(
+            "UPDATE formulas SET output_type = 'PRODUCT' WHERE output_type IS NULL"
         )
     )
 
@@ -135,6 +189,70 @@ with engine.connect() as conn:
     conn.execute(
         text(
             "ALTER TABLE lots ADD COLUMN IF NOT EXISTS inventory_unit_cost FLOAT"
+        )
+    )
+
+    conn.execute(
+        text(
+            "ALTER TABLE lots ADD COLUMN IF NOT EXISTS output_type VARCHAR DEFAULT 'PRODUCT'"
+        )
+    )
+
+    conn.execute(
+        text(
+            "ALTER TABLE lots ADD COLUMN IF NOT EXISTS output_raw_material_id INTEGER"
+        )
+    )
+
+    conn.execute(
+        text(
+            "ALTER TABLE lots ADD COLUMN IF NOT EXISTS origin VARCHAR DEFAULT 'PRODUCTION'"
+        )
+    )
+
+    conn.execute(
+        text(
+            "UPDATE lots SET output_type = 'PRODUCT' WHERE output_type IS NULL"
+        )
+    )
+
+    conn.execute(
+        text(
+            "UPDATE lots SET origin = 'PRODUCTION' WHERE origin IS NULL"
+        )
+    )
+
+    conn.execute(
+        text(
+            "ALTER TABLE raw_materials ADD COLUMN IF NOT EXISTS is_intermediate INTEGER DEFAULT 0"
+        )
+    )
+
+    conn.execute(
+        text(
+            "ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS movement_type VARCHAR DEFAULT 'OUT'"
+        )
+    )
+
+    conn.execute(
+        text(
+            "UPDATE stock_movements SET movement_type = 'OUT' WHERE movement_type IS NULL"
+        )
+    )
+
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS lot_material_source_allocations (
+                id SERIAL PRIMARY KEY,
+                consumer_lot_id INTEGER REFERENCES lots(id) ON DELETE CASCADE,
+                raw_material_id INTEGER REFERENCES raw_materials(id),
+                source_lot_id INTEGER REFERENCES lots(id),
+                quantity FLOAT DEFAULT 0,
+                unit_cost FLOAT DEFAULT 0,
+                subtotal_cost FLOAT DEFAULT 0
+            )
+            """
         )
     )
 
@@ -381,6 +499,13 @@ def create_default_accounts():
         },
 
         {
+            "code": "1.1.04",
+            "name": "Cuentas a Cobrar",
+            "type": "ACTIVO",
+            "category": "ACTIVO"
+        },
+
+        {
             "code": "1.2.01",
             "name": "Materia Prima",
             "type": "ACTIVO",
@@ -570,6 +695,18 @@ def infer_journal_origin(
 
         return "BAJA_STOCK"
 
+    if normalized.startswith(
+        "alta de stock"
+    ):
+
+        return "ALTA_STOCK"
+
+    if normalized.startswith(
+        "cobro venta"
+    ):
+
+        return "COBRO_CTA_CTE"
+
     return "MANUAL"
 
 
@@ -659,6 +796,24 @@ def get_inventory_unit_cost(
     if units <= 0:
 
         return 0
+
+    if str(
+        getattr(
+            lot,
+            "output_type",
+            "PRODUCT"
+        )
+        or
+        "PRODUCT"
+    ).upper() == "RAW_MATERIAL":
+
+        total_cost = float(
+            lot.total_cost or 0
+        )
+
+        if total_cost > 0:
+
+            return total_cost / units
 
     material_cost = float(
         lot.material_cost or 0
@@ -1302,6 +1457,53 @@ def get_db():
 
 
 
+def parse_date_value(
+    value,
+    field_name="fecha",
+    allow_none=False
+):
+
+    if value in {
+        None,
+        ""
+    }:
+
+        if allow_none:
+
+            return None
+
+        raise ValueError(
+            f"La {field_name} es obligatoria"
+        )
+
+    if isinstance(
+        value,
+        datetime
+    ):
+
+        return value.date()
+
+    if isinstance(
+        value,
+        date
+    ):
+
+        return value
+
+    try:
+
+        return datetime.strptime(
+            str(value)[:10],
+            "%Y-%m-%d"
+        ).date()
+
+    except Exception as error:
+
+        raise ValueError(
+            f"La {field_name} no tiene un formato válido"
+        ) from error
+
+
 # ================= NUMERACIÓN CORRELATIVA =================
 
 def initialize_document_counters():
@@ -1781,6 +1983,101 @@ def update_product(
 
 # ================= VENTAS =================
 
+def is_account_current_method(
+    payment_method
+):
+
+    normalized = str(
+        payment_method or ""
+    ).strip().lower()
+
+    return normalized in {
+        "cuenta corriente",
+        "cta cte",
+        "cta. cte.",
+        "cta. cte"
+    }
+
+
+def sync_sale_payment_status(
+    db,
+    sale
+):
+
+    payments_total = sum(
+        float(payment.amount or 0)
+        for payment in db.query(SalePayment).filter(
+            SalePayment.sale_id == sale.id
+        ).all()
+    )
+
+    total = float(sale.total or 0)
+
+    if is_account_current_method(
+        sale.payment_method
+    ):
+
+        sale.amount_paid = min(
+            payments_total,
+            total
+        )
+
+        sale.balance = max(
+            total - payments_total,
+            0
+        )
+
+        if sale.balance <= 0.000001:
+
+            sale.payment_status = "PAGADA"
+
+        elif payments_total > 0:
+
+            sale.payment_status = "PARCIAL"
+
+        else:
+
+            sale.payment_status = "PENDIENTE"
+
+    else:
+
+        sale.amount_paid = total
+        sale.balance = 0
+        sale.payment_status = "PAGADA"
+
+
+def initialize_existing_sale_balances():
+
+    db = SessionLocal()
+
+    try:
+
+        for sale in db.query(Sale).all():
+
+            sync_sale_payment_status(
+                db,
+                sale
+            )
+
+        db.commit()
+
+    except Exception as error:
+
+        db.rollback()
+
+        print(
+            "ERROR INICIALIZANDO SALDOS DE VENTAS:",
+            error
+        )
+
+    finally:
+
+        db.close()
+
+
+initialize_existing_sale_balances()
+
+
 @app.post("/sales")
 def create_sale(
     data: dict,
@@ -1810,6 +2107,22 @@ def create_sale(
 
         total=0,
 
+        amount_paid=0,
+
+        balance=0,
+
+        payment_status=(
+            "PENDIENTE"
+            if is_account_current_method(
+                data.get(
+                    "payment_method",
+                    "Caja"
+                )
+            )
+            else
+            "PAGADA"
+        ),
+
     )
 
     db.add(sale)
@@ -1827,6 +2140,15 @@ def create_sale(
 def sale_payment_account(
     payment_method
 ):
+
+    if is_account_current_method(
+        payment_method
+    ):
+
+        return (
+            "1.1.04",
+            "Cuentas a Cobrar"
+        )
 
     if payment_method == "Banco":
 
@@ -2222,6 +2544,11 @@ def apply_sale_items(
             origin_id=sale.id
         )
 
+    sync_sale_payment_status(
+        db,
+        sale
+    )
+
     return (
         total_cost_of_sale,
         zero_cost_lots
@@ -2323,6 +2650,36 @@ def update_sale(
 
     try:
 
+        requested_payment_method = str(
+            data.get(
+                "payment_method",
+                sale.payment_method
+            )
+            or
+            "Caja"
+        ).strip()
+
+        payments_total = sum(
+            float(payment.amount or 0)
+            for payment in db.query(SalePayment).filter(
+                SalePayment.sale_id == sale.id
+            ).all()
+        )
+
+        if (
+            payments_total > 0
+            and
+            not is_account_current_method(
+                requested_payment_method
+            )
+        ):
+
+            raise ValueError(
+                "La venta ya tiene cobros registrados. "
+                "Primero eliminá esos cobros antes de cambiar "
+                "el medio de pago de cuenta corriente."
+            )
+
         restore_sale_details(
             db,
             sale
@@ -2344,14 +2701,7 @@ def update_sale(
             )
         ).strip()
 
-        sale.payment_method = str(
-            data.get(
-                "payment_method",
-                "Caja"
-            )
-            or
-            "Caja"
-        ).strip()
+        sale.payment_method = requested_payment_method
 
         total_cost, zero_cost_lots = (
             apply_sale_items(
@@ -2359,6 +2709,17 @@ def update_sale(
                 sale,
                 data.get("items", [])
             )
+        )
+
+        if payments_total > float(sale.total or 0) + 0.000001:
+
+            raise ValueError(
+                "El nuevo total de la venta es menor que los cobros ya registrados."
+            )
+
+        sync_sale_payment_status(
+            db,
+            sale
         )
 
         db.commit()
@@ -2409,16 +2770,12 @@ def get_sales(
     )
 
     sale_items = db.query(SaleItem).all()
-
+    sale_payments = db.query(SalePayment).all()
     products = db.query(Product).all()
 
     product_name_by_id = {
-
-        product.id:
-        product.name
-
+        product.id: product.name
         for product in products
-
     }
 
     items_by_sale = {}
@@ -2429,77 +2786,364 @@ def get_sales(
             item.sale_id,
             []
         ).append({
-
-            "id":
-            item.id,
-
-            "product_id":
-            item.product_id,
-
-            "name":
-            product_name_by_id.get(
+            "id": item.id,
+            "product_id": item.product_id,
+            "name": product_name_by_id.get(
                 item.product_id,
                 "Producto sin nombre"
             ),
-
-            "quantity":
-            float(
-                item.quantity or 0
-            ),
-
-            "price":
-            float(
-                item.price or 0
-            ),
-
-            "subtotal":
-            float(
-                item.subtotal or 0
-            )
-
+            "quantity": float(item.quantity or 0),
+            "price": float(item.price or 0),
+            "subtotal": float(item.subtotal or 0)
         })
 
-    return [
+    payments_by_sale = {}
 
-        {
+    for payment in sale_payments:
 
-            "id":
-            sale.id,
+        payments_by_sale.setdefault(
+            payment.sale_id,
+            []
+        ).append({
+            "id": payment.id,
+            "number": payment.number,
+            "date": payment.date,
+            "payment_method": payment.payment_method,
+            "amount": float(payment.amount or 0),
+            "notes": payment.notes or ""
+        })
 
-            "number":
-            sale.number,
+    result = []
 
-            "client":
-            sale.client,
+    for sale in sales:
 
-            "date":
-            sale.date,
+        sync_sale_payment_status(
+            db,
+            sale
+        )
 
-            "payment_method":
-            sale.payment_method,
-
-            "total":
-            float(
-                sale.total or 0
+        result.append({
+            "id": sale.id,
+            "number": sale.number,
+            "client": sale.client,
+            "date": sale.date,
+            "payment_method": sale.payment_method,
+            "total": float(sale.total or 0),
+            "amount_paid": float(sale.amount_paid or 0),
+            "balance": float(sale.balance or 0),
+            "payment_status": sale.payment_status or "PAGADA",
+            "items": items_by_sale.get(
+                sale.id,
+                []
             ),
-
-            "items":
-            items_by_sale.get(
+            "payments": payments_by_sale.get(
                 sale.id,
                 []
             )
+        })
 
+    db.commit()
+
+    return result
+
+
+@app.get("/accounts-receivable")
+def get_accounts_receivable(
+    db: Session = Depends(get_db)
+):
+
+    sales = (
+        db.query(Sale)
+        .filter(
+            Sale.balance > 0.000001
+        )
+        .order_by(
+            Sale.date.asc(),
+            Sale.id.asc()
+        )
+        .all()
+    )
+
+    return [
+        {
+            "sale_id": sale.id,
+            "number": sale.number,
+            "client": sale.client,
+            "date": sale.date,
+            "total": float(sale.total or 0),
+            "amount_paid": float(sale.amount_paid or 0),
+            "balance": float(sale.balance or 0),
+            "payment_status": sale.payment_status or "PENDIENTE"
+        }
+        for sale in sales
+    ]
+
+
+@app.get("/sales/{sale_id}/payments")
+def get_sale_payments(
+    sale_id: int,
+    db: Session = Depends(get_db)
+):
+
+    return [
+        {
+            "id": payment.id,
+            "number": payment.number,
+            "sale_id": payment.sale_id,
+            "date": payment.date,
+            "payment_method": payment.payment_method,
+            "amount": float(payment.amount or 0),
+            "notes": payment.notes or ""
+        }
+        for payment in (
+            db.query(SalePayment)
+            .filter(
+                SalePayment.sale_id == sale_id
+            )
+            .order_by(
+                SalePayment.date.asc(),
+                SalePayment.id.asc()
+            )
+            .all()
+        )
+    ]
+
+
+@app.post("/sales/{sale_id}/payments")
+def create_sale_payment(
+    sale_id: int,
+    data: dict,
+    db: Session = Depends(get_db)
+):
+
+    sale = (
+        db.query(Sale)
+        .filter(
+            Sale.id == sale_id
+        )
+        .with_for_update()
+        .first()
+    )
+
+    if not sale:
+
+        return {
+            "error":
+            "Venta no encontrada"
         }
 
-        for sale in sales
+    if not is_account_current_method(
+        sale.payment_method
+    ):
 
-    ]
+        return {
+            "error":
+            "Esta venta no fue registrada en cuenta corriente"
+        }
+
+    try:
+
+        amount = float(
+            data.get(
+                "amount",
+                0
+            )
+            or
+            0
+        )
+
+        date = str(
+            data.get(
+                "date",
+                str(datetime.now())[:10]
+            )
+        ).strip()
+
+        payment_method = str(
+            data.get(
+                "payment_method",
+                "Caja"
+            )
+            or
+            "Caja"
+        ).strip()
+
+        notes = str(
+            data.get(
+                "notes",
+                ""
+            )
+            or
+            ""
+        ).strip()
+
+        sync_sale_payment_status(
+            db,
+            sale
+        )
+
+        if amount <= 0:
+
+            raise ValueError(
+                "El importe debe ser mayor a cero"
+            )
+
+        if is_account_current_method(
+            payment_method
+        ):
+
+            raise ValueError(
+                "Elegí el medio real con el que se recibió el cobro"
+            )
+
+        if amount > float(sale.balance or 0) + 0.000001:
+
+            raise ValueError(
+                "El cobro supera el saldo pendiente de la venta"
+            )
+
+        payment = SalePayment(
+            number=None,
+            sale_id=sale.id,
+            date=date,
+            payment_method=payment_method,
+            amount=amount,
+            notes=notes
+        )
+
+        db.add(payment)
+        db.flush()
+
+        payment.number = f"CC{payment.id:04d}"
+
+        payment_code, payment_name = (
+            sale_payment_account(
+                payment_method
+            )
+        )
+
+        registrar_asiento(
+            db=db,
+            fecha=date,
+            concepto=f"Cobro venta {sale.number} - {payment.number}",
+            debe_codigo=payment_code,
+            debe_nombre=payment_name,
+            haber_codigo="1.1.04",
+            haber_nombre="Cuentas a Cobrar",
+            importe=amount,
+            origin="COBRO_CTA_CTE",
+            origin_id=payment.id
+        )
+
+        sync_sale_payment_status(
+            db,
+            sale
+        )
+
+        db.commit()
+        db.refresh(payment)
+
+        return {
+            "id": payment.id,
+            "number": payment.number,
+            "message": "Cobro registrado correctamente",
+            "amount_paid": round(
+                float(sale.amount_paid or 0),
+                2
+            ),
+            "balance": round(
+                float(sale.balance or 0),
+                2
+            ),
+            "payment_status": sale.payment_status
+        }
+
+    except Exception as error:
+
+        db.rollback()
+
+        return {
+            "error":
+            f"No se pudo registrar el cobro: {error}"
+        }
+
+
+@app.delete("/sale-payments/{payment_id}")
+def delete_sale_payment(
+    payment_id: int,
+    db: Session = Depends(get_db)
+):
+
+    payment = db.query(SalePayment).filter(
+        SalePayment.id == payment_id
+    ).first()
+
+    if not payment:
+
+        return {
+            "error":
+            "Cobro no encontrado"
+        }
+
+    sale = db.query(Sale).filter(
+        Sale.id == payment.sale_id
+    ).first()
+
+    try:
+
+        db.query(JournalEntry).filter(
+            JournalEntry.origin == "COBRO_CTA_CTE",
+            JournalEntry.origin_id == payment.id
+        ).delete(
+            synchronize_session=False
+        )
+
+        db.delete(payment)
+        db.flush()
+
+        if sale:
+
+            sync_sale_payment_status(
+                db,
+                sale
+            )
+
+        db.commit()
+
+        return {
+            "message":
+            "Cobro eliminado correctamente"
+        }
+
+    except Exception as error:
+
+        db.rollback()
+
+        return {
+            "error":
+            f"No se pudo eliminar el cobro: {error}"
+        }
 
 
 def reverse_and_delete_sale(
     db,
     sale
 ):
+
+    payments = db.query(SalePayment).filter(
+        SalePayment.sale_id == sale.id
+    ).all()
+
+    for payment in payments:
+
+        db.query(JournalEntry).filter(
+            JournalEntry.origin == "COBRO_CTA_CTE",
+            JournalEntry.origin_id == payment.id
+        ).delete(
+            synchronize_session=False
+        )
+
+        db.delete(payment)
 
     restore_sale_details(
         db,
@@ -2613,6 +3257,119 @@ STOCK_MOVEMENT_REASONS = {
 }
 
 
+def latest_formula_for_product(
+    db,
+    product_id
+):
+
+    return (
+        db.query(Formula)
+        .filter(
+            Formula.output_product_id == product_id
+        )
+        .order_by(
+            Formula.id.desc()
+        )
+        .first()
+    )
+
+
+def latest_product_inventory_cost(
+    db,
+    product_id
+):
+
+    lots = (
+        db.query(Lot)
+        .join(
+            Formula,
+            Lot.formula_id == Formula.id
+        )
+        .filter(
+            Formula.output_product_id == product_id
+        )
+        .order_by(
+            Lot.production_date.desc(),
+            Lot.id.desc()
+        )
+        .all()
+    )
+
+    for lot in lots:
+
+        unit_cost = get_inventory_unit_cost(
+            lot
+        )
+
+        if unit_cost > 0:
+
+            return unit_cost
+
+    return 0
+
+
+def create_positive_adjustment_lot(
+    db,
+    product,
+    quantity,
+    date,
+    movement_number,
+    notes
+):
+
+    formula = latest_formula_for_product(
+        db,
+        product.id
+    )
+
+    if not formula:
+
+        raise ValueError(
+            f"{product.name} no tiene una fórmula asociada para respaldar el alta."
+        )
+
+    unit_cost = latest_product_inventory_cost(
+        db,
+        product.id
+    )
+
+    total_cost = quantity * unit_cost
+
+    lot = Lot(
+        lot_number=take_next_document_number(
+            db,
+            "LOT"
+        ),
+        formula_id=formula.id,
+        output_type="PRODUCT",
+        output_raw_material_id=None,
+        origin="STOCK_ADJUSTMENT",
+        production_date=parse_date_value(
+            date,
+            "fecha del ajuste"
+        ),
+        expiration_date=None,
+        units_produced=quantity,
+        remaining_units=quantity,
+        real_labor_hours=0,
+        material_cost=total_cost,
+        labor_cost=0,
+        total_cost=total_cost,
+        unit_cost=unit_cost,
+        inventory_unit_cost=unit_cost,
+        notes=(
+            f"Alta por control de stock {movement_number}. "
+            f"{notes}"
+        ).strip(),
+        status="Disponible"
+    )
+
+    db.add(lot)
+    db.flush()
+
+    return lot, total_cost
+
+
 @app.post("/stock-movements")
 def create_stock_movement(
     data: dict,
@@ -2633,6 +3390,18 @@ def create_stock_movement(
         )
     ).strip().upper()
 
+    movement_type = str(
+        data.get(
+            "movement_type",
+            data.get(
+                "type",
+                "OUT"
+            )
+        )
+        or
+        "OUT"
+    ).strip().upper()
+
     notes = str(
         data.get(
             "notes",
@@ -2645,6 +3414,19 @@ def create_stock_movement(
         []
     )
 
+    if movement_type in {
+        "ALTA",
+        "IN",
+        "ENTRADA",
+        "POSITIVE"
+    }:
+
+        movement_type = "IN"
+
+    else:
+
+        movement_type = "OUT"
+
     if not date:
 
         return {
@@ -2652,17 +3434,26 @@ def create_stock_movement(
             "La fecha es obligatoria"
         }
 
-    reason_data = (
-        STOCK_MOVEMENT_REASONS.get(
-            reason
-        )
+    reason_data = STOCK_MOVEMENT_REASONS.get(
+        reason
     )
 
     if not reason_data:
 
         return {
             "error":
-            "El motivo de la baja no es válido"
+            "El motivo del ajuste no es válido"
+        }
+
+    if (
+        movement_type == "IN"
+        and
+        reason != "STOCK_CONTROL"
+    ):
+
+        return {
+            "error":
+            "Las altas solo pueden registrarse por control de stock"
         }
 
     if not isinstance(
@@ -2724,17 +3515,18 @@ def create_stock_movement(
 
     products_by_id = {}
 
-    # ==========================
-    # VALIDAR STOCK GENERAL Y FIFO
-    # ==========================
-
     for product_id, required_quantity in (
         quantities_by_product.items()
     ):
 
-        product = db.query(Product).filter(
-            Product.id == product_id
-        ).first()
+        product = (
+            db.query(Product)
+            .filter(
+                Product.id == product_id
+            )
+            .with_for_update()
+            .first()
+        )
 
         if not product:
 
@@ -2744,6 +3536,23 @@ def create_stock_movement(
             }
 
         products_by_id[product_id] = product
+
+        if movement_type == "IN":
+
+            if not latest_formula_for_product(
+                db,
+                product_id
+            ):
+
+                return {
+                    "error":
+                    (
+                        f"{product.name} no tiene una fórmula asociada. "
+                        "No se puede crear un lote de ajuste seguro."
+                    )
+                }
+
+            continue
 
         if (
             float(product.stock or 0)
@@ -2801,6 +3610,7 @@ def create_stock_movement(
         number=None,
         date=date,
         reason=reason,
+        movement_type=movement_type,
         notes=notes,
         total_cost=0
     )
@@ -2810,16 +3620,17 @@ def create_stock_movement(
         db.add(movement)
         db.flush()
 
-        movement.number = (
-            f"BS{movement.id:04d}"
+        prefix = (
+            "AS"
+            if movement_type == "IN"
+            else
+            "BS"
         )
+
+        movement.number = f"{prefix}{movement.id:04d}"
 
         total_cost = 0
         zero_cost_lots = []
-
-        # ==========================
-        # DESCONTAR PRODUCTOS POR FIFO
-        # ==========================
 
         for product_id, quantity in (
             quantities_by_product.items()
@@ -2838,6 +3649,49 @@ def create_stock_movement(
 
             db.add(movement_item)
             db.flush()
+
+            if movement_type == "IN":
+
+                adjustment_lot, item_cost = (
+                    create_positive_adjustment_lot(
+                        db=db,
+                        product=product,
+                        quantity=quantity,
+                        date=date,
+                        movement_number=movement.number,
+                        notes=notes
+                    )
+                )
+
+                db.add(
+                    StockMovementLotAllocation(
+                        stock_movement_item_id=movement_item.id,
+                        lot_id=adjustment_lot.id,
+                        quantity=quantity,
+                        unit_cost=get_inventory_unit_cost(
+                            adjustment_lot
+                        ),
+                        subtotal_cost=item_cost
+                    )
+                )
+
+                movement_item.cost_total = item_cost
+
+                product.stock = (
+                    float(product.stock or 0)
+                    +
+                    quantity
+                )
+
+                total_cost += item_cost
+
+                if item_cost <= 0:
+
+                    zero_cost_lots.append(
+                        str(adjustment_lot.lot_number)
+                    )
+
+                continue
 
             quantity_to_allocate = quantity
             item_cost = 0
@@ -2875,10 +3729,8 @@ def create_stock_movement(
 
                     continue
 
-                unit_cost = (
-                    get_inventory_unit_cost(
-                        lot
-                    )
+                unit_cost = get_inventory_unit_cost(
+                    lot
                 )
 
                 subtotal_cost = (
@@ -2889,8 +3741,7 @@ def create_stock_movement(
 
                 db.add(
                     StockMovementLotAllocation(
-                        stock_movement_item_id=
-                        movement_item.id,
+                        stock_movement_item_id=movement_item.id,
                         lot_id=lot.id,
                         quantity=quantity_used,
                         unit_cost=unit_cost,
@@ -2920,10 +3771,7 @@ def create_stock_movement(
                     )
 
                 item_cost += subtotal_cost
-
-                quantity_to_allocate -= (
-                    quantity_used
-                )
+                quantity_to_allocate -= quantity_used
 
                 if quantity_to_allocate <= 0.000001:
 
@@ -2932,13 +3780,10 @@ def create_stock_movement(
             if quantity_to_allocate > 0.000001:
 
                 raise ValueError(
-                    f"No fue posible asignar todos los lotes "
-                    f"de {product.name}"
+                    f"No fue posible asignar todos los lotes de {product.name}"
                 )
 
-            movement_item.cost_total = (
-                item_cost
-            )
+            movement_item.cost_total = item_cost
 
             product.stock = (
                 float(product.stock or 0)
@@ -2950,42 +3795,60 @@ def create_stock_movement(
 
         movement.total_cost = total_cost
 
-        # Un único asiento por registración, aunque incluya varios productos.
         if total_cost > 0:
 
-            registrar_asiento(
-                db=db,
-                fecha=date,
-                concepto=(
-                    f"Baja de stock {movement.number} - "
-                    f"{reason_data['label']}"
-                ),
-                debe_codigo=
-                reason_data["account_code"],
-                debe_nombre=
-                reason_data["account_name"],
-                haber_codigo="1.2.02",
-                haber_nombre="Productos Terminados",
-                importe=total_cost,
-                origin="BAJA_STOCK",
-                origin_id=movement.id
-            )
+            if movement_type == "IN":
+
+                registrar_asiento(
+                    db=db,
+                    fecha=date,
+                    concepto=(
+                        f"Alta de stock {movement.number} - "
+                        f"{reason_data['label']}"
+                    ),
+                    debe_codigo="1.2.02",
+                    debe_nombre="Productos Terminados",
+                    haber_codigo=reason_data["account_code"],
+                    haber_nombre=reason_data["account_name"],
+                    importe=total_cost,
+                    origin="ALTA_STOCK",
+                    origin_id=movement.id
+                )
+
+            else:
+
+                registrar_asiento(
+                    db=db,
+                    fecha=date,
+                    concepto=(
+                        f"Baja de stock {movement.number} - "
+                        f"{reason_data['label']}"
+                    ),
+                    debe_codigo=reason_data["account_code"],
+                    debe_nombre=reason_data["account_name"],
+                    haber_codigo="1.2.02",
+                    haber_nombre="Productos Terminados",
+                    importe=total_cost,
+                    origin="BAJA_STOCK",
+                    origin_id=movement.id
+                )
 
         db.commit()
         db.refresh(movement)
 
+        action_label = (
+            "Alta"
+            if movement_type == "IN"
+            else
+            "Baja"
+        )
+
         response = {
-            "id":
-            movement.id,
-
-            "number":
-            movement.number,
-
-            "message":
-            "Baja de stock guardada correctamente",
-
-            "total_cost":
-            round(total_cost, 2)
+            "id": movement.id,
+            "number": movement.number,
+            "movement_type": movement_type,
+            "message": f"{action_label} de stock guardada correctamente",
+            "total_cost": round(total_cost, 2)
         }
 
         if zero_cost_lots:
@@ -3006,9 +3869,16 @@ def create_stock_movement(
 
         db.rollback()
 
+        action_label = (
+            "alta"
+            if movement_type == "IN"
+            else
+            "baja"
+        )
+
         return {
             "error":
-            f"No se pudo guardar la baja de stock: {error}"
+            f"No se pudo guardar la {action_label} de stock: {error}"
         }
 
 
@@ -3026,15 +3896,14 @@ def get_stock_movements(
         .all()
     )
 
-    movement_items = (
-        db.query(StockMovementItem).all()
-    )
+    movement_items = db.query(
+        StockMovementItem
+    ).all()
 
     products = db.query(Product).all()
 
     product_name_by_id = {
-        product.id:
-        product.name
+        product.id: product.name
         for product in products
     }
 
@@ -3046,56 +3915,43 @@ def get_stock_movements(
             item.stock_movement_id,
             []
         ).append({
-            "id":
-            item.id,
-
-            "product_id":
-            item.product_id,
-
-            "name":
-            product_name_by_id.get(
+            "id": item.id,
+            "product_id": item.product_id,
+            "name": product_name_by_id.get(
                 item.product_id,
                 "Producto sin nombre"
             ),
-
-            "quantity":
-            float(item.quantity or 0),
-
-            "cost_total":
-            float(item.cost_total or 0)
+            "quantity": float(item.quantity or 0),
+            "cost_total": float(item.cost_total or 0)
         })
 
     return [
         {
-            "id":
-            movement.id,
-
-            "number":
-            movement.number,
-
-            "date":
-            movement.date,
-
-            "reason":
-            movement.reason,
-
-            "reason_label":
-            STOCK_MOVEMENT_REASONS.get(
+            "id": movement.id,
+            "number": movement.number,
+            "date": movement.date,
+            "movement_type": (
+                movement.movement_type
+                or
+                "OUT"
+            ),
+            "movement_label": (
+                "Alta"
+                if (movement.movement_type or "OUT") == "IN"
+                else
+                "Baja"
+            ),
+            "reason": movement.reason,
+            "reason_label": STOCK_MOVEMENT_REASONS.get(
                 movement.reason,
                 {}
             ).get(
                 "label",
                 movement.reason
             ),
-
-            "notes":
-            movement.notes or "",
-
-            "total_cost":
-            float(movement.total_cost or 0),
-
-            "items":
-            items_by_movement.get(
+            "notes": movement.notes or "",
+            "total_cost": float(movement.total_cost or 0),
+            "items": items_by_movement.get(
                 movement.id,
                 []
             )
@@ -3118,67 +3974,164 @@ def delete_stock_movement(
 
         return {
             "error":
-            "Baja de stock no encontrada"
+            "Ajuste de stock no encontrado"
         }
+
+    movement_type = (
+        movement.movement_type
+        or
+        "OUT"
+    )
 
     try:
 
         movement_items = (
             db.query(StockMovementItem)
             .filter(
-                StockMovementItem.stock_movement_id
-                ==
-                movement.id
+                StockMovementItem.stock_movement_id == movement.id
             )
             .all()
         )
 
-        for item in movement_items:
+        if movement_type == "IN":
 
-            allocations = (
-                db.query(StockMovementLotAllocation)
-                .filter(
-                    StockMovementLotAllocation.stock_movement_item_id
-                    ==
-                    item.id
-                )
-                .all()
-            )
+            validations = []
 
-            for allocation in allocations:
+            for item in movement_items:
 
-                lot = db.query(Lot).filter(
-                    Lot.id == allocation.lot_id
+                product = db.query(Product).filter(
+                    Product.id == item.product_id
                 ).first()
 
-                if lot:
+                allocations = (
+                    db.query(StockMovementLotAllocation)
+                    .filter(
+                        StockMovementLotAllocation.stock_movement_item_id == item.id
+                    )
+                    .all()
+                )
 
-                    lot.remaining_units = (
-                        float(lot.remaining_units or 0)
-                        +
-                        float(allocation.quantity or 0)
+                if not product:
+
+                    raise ValueError(
+                        "No se encontró uno de los productos del ajuste"
                     )
 
-                    lot.status = "Disponible"
+                if float(product.stock or 0) + 0.000001 < float(item.quantity or 0):
 
-                db.delete(allocation)
+                    raise ValueError(
+                        f"No se puede revertir el alta porque el stock actual de {product.name} es menor."
+                    )
 
-            product = db.query(Product).filter(
-                Product.id == item.product_id
-            ).first()
+                for allocation in allocations:
 
-            if product:
+                    lot = db.query(Lot).filter(
+                        Lot.id == allocation.lot_id
+                    ).first()
+
+                    if not lot:
+
+                        raise ValueError(
+                            "No se encontró el lote creado por el alta"
+                        )
+
+                    if lot.origin != "STOCK_ADJUSTMENT":
+
+                        raise ValueError(
+                            "El lote del alta no puede eliminarse automáticamente"
+                        )
+
+                    if (
+                        float(lot.remaining_units or 0)
+                        +
+                        0.000001
+                        <
+                        float(allocation.quantity or 0)
+                    ):
+
+                        raise ValueError(
+                            (
+                                f"El lote {lot.lot_number} ya fue utilizado. "
+                                "No se puede eliminar esta alta."
+                            )
+                        )
+
+                    validations.append(
+                        (
+                            item,
+                            product,
+                            allocation,
+                            lot
+                        )
+                    )
+
+            for item, product, allocation, lot in validations:
 
                 product.stock = (
                     float(product.stock or 0)
-                    +
-                    float(item.quantity or 0)
+                    -
+                    float(allocation.quantity or 0)
                 )
 
-            db.delete(item)
+                db.delete(allocation)
+                db.delete(lot)
+
+            for item in movement_items:
+
+                db.delete(item)
+
+            origin = "ALTA_STOCK"
+            action_label = "Alta"
+
+        else:
+
+            for item in movement_items:
+
+                allocations = (
+                    db.query(StockMovementLotAllocation)
+                    .filter(
+                        StockMovementLotAllocation.stock_movement_item_id == item.id
+                    )
+                    .all()
+                )
+
+                for allocation in allocations:
+
+                    lot = db.query(Lot).filter(
+                        Lot.id == allocation.lot_id
+                    ).first()
+
+                    if lot:
+
+                        lot.remaining_units = (
+                            float(lot.remaining_units or 0)
+                            +
+                            float(allocation.quantity or 0)
+                        )
+
+                        lot.status = "Disponible"
+
+                    db.delete(allocation)
+
+                product = db.query(Product).filter(
+                    Product.id == item.product_id
+                ).first()
+
+                if product:
+
+                    product.stock = (
+                        float(product.stock or 0)
+                        +
+                        float(item.quantity or 0)
+                    )
+
+                db.delete(item)
+
+            origin = "BAJA_STOCK"
+            action_label = "Baja"
 
         db.query(JournalEntry).filter(
-            JournalEntry.origin == "BAJA_STOCK",
+            JournalEntry.origin == origin,
             JournalEntry.origin_id == movement.id
         ).delete(
             synchronize_session=False
@@ -3187,7 +4140,7 @@ def delete_stock_movement(
         db.query(JournalEntry).filter(
             JournalEntry.origin_id.is_(None),
             JournalEntry.concept.like(
-                f"Baja de stock {movement.number}%"
+                f"{action_label} de stock {movement.number}%"
             )
         ).delete(
             synchronize_session=False
@@ -3198,7 +4151,7 @@ def delete_stock_movement(
 
         return {
             "message":
-            f"Baja de stock {movement.number} eliminada correctamente"
+            f"{action_label} de stock {movement.number} eliminada correctamente"
         }
 
     except Exception as error:
@@ -3207,8 +4160,9 @@ def delete_stock_movement(
 
         return {
             "error":
-            f"No se pudo eliminar la baja de stock: {error}"
+            f"No se pudo eliminar el ajuste de stock: {error}"
         }
+
 
 # ================= COMPRAS =================
 
@@ -4372,35 +5326,6 @@ def add_purchase_item(
         "mensaje": "compra actualizada"
     }
 
-@app.put("/raw-materials/{material_id}")
-def update_raw_material(
-    material_id: int,
-    material: RawMaterialCreate,
-    db: Session = Depends(get_db)
-):
-
-    item = db.query(RawMaterial).filter(
-        RawMaterial.id == material_id
-    ).first()
-
-    if not item:
-        return {"error": "No existe"}
-
-    item.code = material.code
-    item.name = material.name
-    item.category = material.category
-    item.unit = material.unit
-    item.stock = material.stock
-    item.minimum_stock = material.minimum_stock
-    item.cost = material.cost
-    item.supplier = material.supplier
-    item.location = material.location
-
-    db.commit()
-    db.refresh(item)
-
-    return item
-
 @app.delete("/purchases/{purchase_id}")
 def delete_purchase(
     purchase_id: int,
@@ -5541,6 +6466,16 @@ def dashboard(
     }
 
 
+    raw_material_name_by_id = {
+
+        material.id:
+        material.name
+
+        for material in raw_materials
+
+    }
+
+
     recent_sales = sorted(
 
         sales,
@@ -5610,11 +6545,25 @@ def dashboard(
 
         if formula:
 
-            product_name = (
-                product_name_by_id.get(
+            if str(
+                getattr(
+                    formula,
+                    "output_type",
+                    "PRODUCT"
+                )
+                or
+                "PRODUCT"
+            ).upper() == "RAW_MATERIAL":
+
+                product_name = raw_material_name_by_id.get(
+                    formula.output_raw_material_id
+                )
+
+            else:
+
+                product_name = product_name_by_id.get(
                     formula.output_product_id
                 )
-            )
 
         recent_lots_data.append({
 
@@ -5956,6 +6905,106 @@ def validated_formula_margin(
     return margin
 
 
+def resolve_formula_output(
+    db,
+    data,
+    current_formula=None
+):
+
+    output_type = str(
+        data.get(
+            "output_type",
+            getattr(
+                current_formula,
+                "output_type",
+                "PRODUCT"
+            )
+            or
+            "PRODUCT"
+        )
+        or
+        "PRODUCT"
+    ).strip().upper()
+
+    if output_type in {
+        "RAW_MATERIAL",
+        "INTERMEDIATE",
+        "MATERIA_PRIMA"
+    }:
+
+        output_type = "RAW_MATERIAL"
+
+        raw_material_id = data.get(
+            "output_raw_material_id",
+            getattr(
+                current_formula,
+                "output_raw_material_id",
+                None
+            )
+        )
+
+        if raw_material_id in {
+            None,
+            ""
+        }:
+
+            raise ValueError(
+                "Seleccioná la materia prima elaborada que produce la fórmula"
+            )
+
+        raw_material = db.query(RawMaterial).filter(
+            RawMaterial.id == int(raw_material_id)
+        ).first()
+
+        if not raw_material:
+
+            raise ValueError(
+                "La materia prima elaborada seleccionada no existe"
+            )
+
+        raw_material.is_intermediate = 1
+
+        return (
+            "RAW_MATERIAL",
+            None,
+            raw_material.id
+        )
+
+    output_product_id = data.get(
+        "output_product_id",
+        getattr(
+            current_formula,
+            "output_product_id",
+            None
+        )
+    )
+
+    if output_product_id in {
+        None,
+        ""
+    }:
+
+        raise ValueError(
+            "Seleccioná el producto terminado que produce la fórmula"
+        )
+
+    product = db.query(Product).filter(
+        Product.id == int(output_product_id)
+    ).first()
+
+    if not product:
+
+        raise ValueError(
+            "El producto terminado seleccionado no existe"
+        )
+
+    return (
+        "PRODUCT",
+        product.id,
+        None
+    )
+
+
 @app.post("/formulas")
 def create_formula(
     data: dict,
@@ -5964,9 +7013,20 @@ def create_formula(
 
     try:
 
+        (
+            output_type,
+            output_product_id,
+            output_raw_material_id
+        ) = resolve_formula_output(
+            db,
+            data
+        )
+
         item = Formula(
             name=str(data.get("name", "")).strip(),
-            output_product_id=int(data.get("output_product_id")),
+            output_product_id=output_product_id,
+            output_raw_material_id=output_raw_material_id,
+            output_type=output_type,
             batch_size=float(data.get("batch_size", 1) or 1),
             labor_hours=float(data.get("labor_hours", 0) or 0),
             units_produced=float(data.get("units_produced", 1) or 1),
@@ -6016,6 +7076,10 @@ def update_formula(
             "Fórmula no encontrada"
         }
 
+    existing_lots = db.query(Lot).filter(
+        Lot.formula_id == item.id
+    ).count()
+
     try:
 
         name = str(
@@ -6033,13 +7097,54 @@ def update_formula(
                 "El nombre de la fórmula es obligatorio"
             )
 
-        item.name = name
-        item.output_product_id = int(
-            data.get(
-                "output_product_id",
-                item.output_product_id
-            )
+        (
+            output_type,
+            output_product_id,
+            output_raw_material_id
+        ) = resolve_formula_output(
+            db,
+            data,
+            current_formula=item
         )
+
+        current_type = str(
+            item.output_type
+            or
+            "PRODUCT"
+        ).upper()
+
+        current_output_id = (
+            item.output_raw_material_id
+            if current_type == "RAW_MATERIAL"
+            else
+            item.output_product_id
+        )
+
+        new_output_id = (
+            output_raw_material_id
+            if output_type == "RAW_MATERIAL"
+            else
+            output_product_id
+        )
+
+        if (
+            existing_lots > 0
+            and
+            (
+                current_type != output_type
+                or
+                current_output_id != new_output_id
+            )
+        ):
+
+            raise ValueError(
+                "No se puede cambiar el resultado de una fórmula que ya tiene lotes"
+            )
+
+        item.name = name
+        item.output_type = output_type
+        item.output_product_id = output_product_id
+        item.output_raw_material_id = output_raw_material_id
         item.batch_size = float(
             data.get(
                 "batch_size",
@@ -6064,12 +7169,10 @@ def update_formula(
             or
             1
         )
-        item.margin_percent = (
-            validated_formula_margin(
-                data.get(
-                    "margin_percent",
-                    item.margin_percent
-                )
+        item.margin_percent = validated_formula_margin(
+            data.get(
+                "margin_percent",
+                item.margin_percent
             )
         )
         item.notes = str(
@@ -6177,6 +7280,511 @@ def get_formula_items(
 
 # ================= LOTES =================
 
+def formula_output_data(
+    db,
+    formula
+):
+
+    output_type = str(
+        getattr(
+            formula,
+            "output_type",
+            "PRODUCT"
+        )
+        or
+        "PRODUCT"
+    ).upper()
+
+    if (
+        output_type == "RAW_MATERIAL"
+        or
+        getattr(
+            formula,
+            "output_raw_material_id",
+            None
+        )
+    ):
+
+        raw = db.query(RawMaterial).filter(
+            RawMaterial.id == formula.output_raw_material_id
+        ).first()
+
+        if not raw:
+
+            raise ValueError(
+                "La fórmula no tiene una materia prima elaborada válida"
+            )
+
+        return (
+            "RAW_MATERIAL",
+            raw
+        )
+
+    product = db.query(Product).filter(
+        Product.id == formula.output_product_id
+    ).first()
+
+    if not product:
+
+        raise ValueError(
+            "La fórmula no tiene un producto terminado válido"
+        )
+
+    return (
+        "PRODUCT",
+        product
+    )
+
+
+def recalculate_intermediate_material_cost(
+    db,
+    raw_material_id
+):
+
+    raw = db.query(RawMaterial).filter(
+        RawMaterial.id == raw_material_id
+    ).first()
+
+    if not raw or not int(
+        raw.is_intermediate or 0
+    ):
+
+        return
+
+    stock = max(
+        float(raw.stock or 0),
+        0
+    )
+
+    if stock <= 0.000001:
+
+        return
+
+    source_lots = db.query(Lot).filter(
+        Lot.output_type == "RAW_MATERIAL",
+        Lot.output_raw_material_id == raw.id,
+        Lot.remaining_units > 0
+    ).all()
+
+    lot_quantity = sum(
+        float(lot.remaining_units or 0)
+        for lot in source_lots
+    )
+
+    lot_value = sum(
+        float(lot.remaining_units or 0)
+        *
+        get_inventory_unit_cost(lot)
+        for lot in source_lots
+    )
+
+    external_quantity = max(
+        stock - lot_quantity,
+        0
+    )
+
+    external_value = (
+        external_quantity
+        *
+        float(raw.cost or 0)
+    )
+
+    if lot_quantity > 0:
+
+        raw.cost = (
+            lot_value
+            +
+            external_value
+        ) / stock
+
+
+def restore_lot_material_consumption(
+    db,
+    lot_id
+):
+
+    affected_intermediate_ids = set()
+
+    allocations = db.query(
+        LotMaterialSourceAllocation
+    ).filter(
+        LotMaterialSourceAllocation.consumer_lot_id == lot_id
+    ).all()
+
+    for allocation in allocations:
+
+        source_lot = db.query(Lot).filter(
+            Lot.id == allocation.source_lot_id
+        ).first()
+
+        if source_lot:
+
+            source_lot.remaining_units = (
+                float(source_lot.remaining_units or 0)
+                +
+                float(allocation.quantity or 0)
+            )
+
+            source_lot.status = "Disponible"
+
+        affected_intermediate_ids.add(
+            allocation.raw_material_id
+        )
+
+        db.delete(allocation)
+
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                raw_material_id,
+                quantity
+            FROM lot_materials
+            WHERE lot_id = :lot_id
+            """
+        ),
+        {
+            "lot_id":
+            lot_id
+        }
+    ).mappings().all()
+
+    for row in rows:
+
+        raw = db.query(RawMaterial).filter(
+            RawMaterial.id == row["raw_material_id"]
+        ).first()
+
+        if raw:
+
+            raw.stock = (
+                float(raw.stock or 0)
+                +
+                float(row["quantity"] or 0)
+            )
+
+            if int(raw.is_intermediate or 0):
+
+                affected_intermediate_ids.add(
+                    raw.id
+                )
+
+    db.execute(
+        text(
+            "DELETE FROM lot_materials WHERE lot_id = :lot_id"
+        ),
+        {
+            "lot_id":
+            lot_id
+        }
+    )
+
+    db.flush()
+
+    for raw_material_id in affected_intermediate_ids:
+
+        recalculate_intermediate_material_cost(
+            db,
+            raw_material_id
+        )
+
+
+def consume_materials_for_lot(
+    db,
+    consumer_lot,
+    materials_data,
+    output_raw_material_id=None
+):
+
+    if not isinstance(
+        materials_data,
+        list
+    ) or not materials_data:
+
+        raise ValueError(
+            "Agregá al menos una materia prima al lote"
+        )
+
+    material_cost = 0
+    affected_intermediate_ids = set()
+
+    for material_data in materials_data:
+
+        raw_material_id = int(
+            material_data.get(
+                "raw_material_id"
+            )
+        )
+
+        quantity_used = float(
+            material_data.get(
+                "real_quantity",
+                material_data.get(
+                    "quantity",
+                    0
+                )
+            )
+            or
+            0
+        )
+
+        raw = (
+            db.query(RawMaterial)
+            .filter(
+                RawMaterial.id == raw_material_id
+            )
+            .with_for_update()
+            .first()
+        )
+
+        if not raw:
+
+            raise ValueError(
+                "Una de las materias primas no existe"
+            )
+
+        if quantity_used <= 0:
+
+            raise ValueError(
+                f"La cantidad usada de {raw.name} debe ser mayor a cero"
+            )
+
+        if (
+            output_raw_material_id
+            and
+            raw.id == output_raw_material_id
+        ):
+
+            raise ValueError(
+                "Una materia prima elaborada no puede usarse a sí misma como ingrediente"
+            )
+
+        if (
+            float(raw.stock or 0)
+            +
+            0.000001
+            <
+            quantity_used
+        ):
+
+            raise ValueError(
+                (
+                    f"Stock insuficiente de {raw.name}. "
+                    f"Disponible: {float(raw.stock or 0):.2f}"
+                )
+            )
+
+        quantity_to_allocate = quantity_used
+        subtotal_cost = 0
+
+        if int(raw.is_intermediate or 0):
+
+            source_lots = (
+                db.query(Lot)
+                .filter(
+                    Lot.output_type == "RAW_MATERIAL",
+                    Lot.output_raw_material_id == raw.id,
+                    Lot.remaining_units > 0
+                )
+                .order_by(
+                    Lot.production_date.asc(),
+                    Lot.id.asc()
+                )
+                .with_for_update()
+                .all()
+            )
+
+            for source_lot in source_lots:
+
+                available = float(
+                    source_lot.remaining_units or 0
+                )
+
+                allocated = min(
+                    available,
+                    quantity_to_allocate
+                )
+
+                if allocated <= 0:
+
+                    continue
+
+                unit_cost = get_inventory_unit_cost(
+                    source_lot
+                )
+
+                allocation_cost = (
+                    allocated
+                    *
+                    unit_cost
+                )
+
+                db.add(
+                    LotMaterialSourceAllocation(
+                        consumer_lot_id=consumer_lot.id,
+                        raw_material_id=raw.id,
+                        source_lot_id=source_lot.id,
+                        quantity=allocated,
+                        unit_cost=unit_cost,
+                        subtotal_cost=allocation_cost
+                    )
+                )
+
+                source_lot.remaining_units = (
+                    available
+                    -
+                    allocated
+                )
+
+                source_lot.status = (
+                    "Disponible"
+                    if source_lot.remaining_units > 0.000001
+                    else
+                    "Agotado"
+                )
+
+                subtotal_cost += allocation_cost
+                quantity_to_allocate -= allocated
+
+                if quantity_to_allocate <= 0.000001:
+
+                    break
+
+            affected_intermediate_ids.add(
+                raw.id
+            )
+
+        if quantity_to_allocate > 0.000001:
+
+            subtotal_cost += (
+                quantity_to_allocate
+                *
+                float(raw.cost or 0)
+            )
+
+        unit_material_cost = (
+            subtotal_cost / quantity_used
+            if quantity_used > 0
+            else 0
+        )
+
+        raw.stock = (
+            float(raw.stock or 0)
+            -
+            quantity_used
+        )
+
+        db.execute(
+            text(
+                """
+                INSERT INTO lot_materials (
+                    lot_id,
+                    raw_material_id,
+                    quantity,
+                    unit_cost,
+                    subtotal_cost,
+                    source
+                )
+                VALUES (
+                    :lot_id,
+                    :raw_material_id,
+                    :quantity,
+                    :unit_cost,
+                    :subtotal_cost,
+                    'REAL'
+                )
+                """
+            ),
+            {
+                "lot_id":
+                consumer_lot.id,
+
+                "raw_material_id":
+                raw.id,
+
+                "quantity":
+                quantity_used,
+
+                "unit_cost":
+                unit_material_cost,
+
+                "subtotal_cost":
+                subtotal_cost
+            }
+        )
+
+        material_cost += subtotal_cost
+
+    db.flush()
+
+    for raw_material_id in affected_intermediate_ids:
+
+        recalculate_intermediate_material_cost(
+            db,
+            raw_material_id
+        )
+
+    return material_cost
+
+
+def replace_lot_production_journal(
+    db,
+    lot,
+    output_type
+):
+
+    db.query(JournalEntry).filter(
+        JournalEntry.origin == "PRODUCCION",
+        JournalEntry.origin_id == lot.id
+    ).delete(
+        synchronize_session=False
+    )
+
+    db.query(JournalEntry).filter(
+        JournalEntry.origin_id.is_(None),
+        JournalEntry.concept == f"Producción lote {lot.lot_number}"
+    ).delete(
+        synchronize_session=False
+    )
+
+    concept = f"Producción lote {lot.lot_number}"
+    production_date = str(lot.production_date)[:10]
+
+    if output_type == "RAW_MATERIAL":
+
+        # Los insumos y el intermedio pertenecen a Materia Prima, por lo que
+        # el traspaso de materiales no cambia el total de esa cuenta. La mano
+        # de obra sí se incorpora al valor del intermedio para no reconocerla
+        # dos veces: primero como gasto y luego dentro del costo de venta.
+        labor_cost = float(lot.labor_cost or 0)
+
+        if labor_cost > 0:
+
+            registrar_asiento(
+                db=db,
+                fecha=production_date,
+                concepto=concept,
+                debe_codigo="1.2.01",
+                debe_nombre="Materia Prima",
+                haber_codigo="2.1.02",
+                haber_nombre="Sueldos a Pagar",
+                importe=labor_cost,
+                origin="PRODUCCION",
+                origin_id=lot.id
+            )
+
+        return
+
+    registrar_asiento_produccion(
+        db=db,
+        fecha=production_date,
+        concepto=concept,
+        costo_materiales=float(lot.material_cost or 0),
+        costo_mano_obra=float(lot.labor_cost or 0),
+        origin_id=lot.id
+    )
+
+
 @app.get("/lots")
 def get_lots(
     db: Session = Depends(get_db)
@@ -6193,17 +7801,21 @@ def get_lots(
 
     formulas = db.query(Formula).all()
     products = db.query(Product).all()
+    raw_materials = db.query(RawMaterial).all()
 
     formula_by_id = {
-        formula.id:
-        formula
+        formula.id: formula
         for formula in formulas
     }
 
     product_name_by_id = {
-        product.id:
-        product.name
+        product.id: product.name
         for product in products
+    }
+
+    raw_name_by_id = {
+        material.id: material.name
+        for material in raw_materials
     }
 
     material_rows = db.execute(
@@ -6236,43 +7848,35 @@ def get_lots(
             row["lot_id"],
             []
         ).append({
-            "raw_material_id":
-            row["raw_material_id"],
-
-            "name":
-            row["name"]
-            or
-            "Materia prima eliminada",
-
-            "unit":
-            row["unit"]
-            or
-            "",
-
-            "quantity":
-            float(row["quantity"] or 0),
-
-            "unit_cost":
-            float(row["unit_cost"] or 0),
-
-            "subtotal_cost":
-            float(row["subtotal_cost"] or 0),
-
-            "source":
-            row["source"]
-            or
-            "REAL"
+            "raw_material_id": row["raw_material_id"],
+            "name": row["name"] or "Materia prima eliminada",
+            "unit": row["unit"] or "",
+            "quantity": float(row["quantity"] or 0),
+            "real_quantity": float(row["quantity"] or 0),
+            "unit_cost": float(row["unit_cost"] or 0),
+            "subtotal_cost": float(row["subtotal_cost"] or 0),
+            "source": row["source"] or "REAL"
         })
 
-    allocation_lot_ids = {
+    sale_lot_ids = {
         row[0]
-        for row in (
-            db.query(
-                SaleLotAllocation.lot_id
-            )
-            .distinct()
-            .all()
-        )
+        for row in db.query(
+            SaleLotAllocation.lot_id
+        ).distinct().all()
+    }
+
+    stock_lot_ids = {
+        row[0]
+        for row in db.query(
+            StockMovementLotAllocation.lot_id
+        ).distinct().all()
+    }
+
+    intermediate_source_lot_ids = {
+        row[0]
+        for row in db.query(
+            LotMaterialSourceAllocation.source_lot_id
+        ).distinct().all()
     }
 
     result = []
@@ -6283,11 +7887,32 @@ def get_lots(
             lot.formula_id
         )
 
+        output_type = str(
+            lot.output_type
+            or
+            getattr(
+                formula,
+                "output_type",
+                "PRODUCT"
+            )
+            or
+            "PRODUCT"
+        ).upper()
+
         product_id = (
             formula.output_product_id
-            if formula
-            else
-            None
+            if formula and output_type == "PRODUCT"
+            else None
+        )
+
+        output_raw_material_id = (
+            lot.output_raw_material_id
+            or
+            (
+                formula.output_raw_material_id
+                if formula
+                else None
+            )
         )
 
         materials = materials_by_lot.get(
@@ -6296,9 +7921,7 @@ def get_lots(
         )
 
         has_estimated_materials = any(
-            material["source"]
-            ==
-            "FORMULA_ESTIMATE"
+            material["source"] == "FORMULA_ESTIMATE"
             for material in materials
         )
 
@@ -6312,121 +7935,437 @@ def get_lots(
             else units_produced
         )
 
-        has_sales = (
-            lot.id
-            in
-            allocation_lot_ids
+        has_consumption = (
+            lot.id in sale_lot_ids
+            or
+            lot.id in stock_lot_ids
+            or
+            lot.id in intermediate_source_lot_ids
+            or
+            abs(
+                remaining_units - units_produced
+            ) > 0.000001
+        )
+
+        is_production_lot = (
+            (lot.origin or "PRODUCTION") == "PRODUCTION"
         )
 
         can_delete = (
-            not has_sales
+            is_production_lot
             and
-            abs(
-                remaining_units
-                -
-                units_produced
-            )
-            <
-            0.000001
+            not has_consumption
+            and
+            bool(materials)
         )
 
         result.append({
-            "id":
-            lot.id,
-
-            "lot_number":
-            lot.lot_number,
-
-            "formula_id":
-            lot.formula_id,
-
-            "formula_name":
-            formula.name
-            if formula
-            else
-            "Fórmula eliminada",
-
-            "product_id":
-            product_id,
-
-            "product_name":
-            product_name_by_id.get(
-                product_id,
-                "Producto sin identificar"
+            "id": lot.id,
+            "lot_number": lot.lot_number,
+            "formula_id": lot.formula_id,
+            "formula_name": (
+                formula.name
+                if formula
+                else "Fórmula eliminada"
             ),
-
-            "production_date":
-            str(lot.production_date or "")[:10],
-
-            "expiration_date":
-            str(lot.expiration_date or "")[:10],
-
-            "units_produced":
-            units_produced,
-
-            "remaining_units":
-            remaining_units,
-
-            "real_labor_hours":
-            float(lot.real_labor_hours or 0),
-
-            "material_cost":
-            float(lot.material_cost or 0),
-
-            "labor_cost":
-            float(lot.labor_cost or 0),
-
-            "total_cost":
-            float(lot.total_cost or 0),
-
-            "unit_cost":
-            float(lot.unit_cost or 0),
-
-            "notes":
-            lot.notes or "",
-
-            "status":
-            lot.status
-            or
-            (
-                "Disponible"
-                if remaining_units > 0
-                else
-                "Agotado"
+            "output_type": output_type,
+            "origin": lot.origin or "PRODUCTION",
+            "product_id": product_id,
+            "product_name": (
+                product_name_by_id.get(
+                    product_id,
+                    "Producto sin identificar"
+                )
+                if output_type == "PRODUCT"
+                else raw_name_by_id.get(
+                    output_raw_material_id,
+                    "Materia prima elaborada sin identificar"
+                )
             ),
-
-            "materials":
-            materials,
-
-            "material_history_source":
-            (
+            "output_raw_material_id": output_raw_material_id,
+            "output_raw_material_name": raw_name_by_id.get(
+                output_raw_material_id,
+                ""
+            ),
+            "production_date": str(lot.production_date or "")[:10],
+            "expiration_date": str(lot.expiration_date or "")[:10],
+            "units_produced": units_produced,
+            "remaining_units": remaining_units,
+            "real_labor_hours": float(lot.real_labor_hours or 0),
+            "material_cost": float(lot.material_cost or 0),
+            "labor_cost": float(lot.labor_cost or 0),
+            "total_cost": float(lot.total_cost or 0),
+            "unit_cost": float(lot.unit_cost or 0),
+            "inventory_unit_cost": get_inventory_unit_cost(lot),
+            "notes": lot.notes or "",
+            "status": (
+                lot.status
+                or
+                (
+                    "Disponible"
+                    if remaining_units > 0
+                    else "Agotado"
+                )
+            ),
+            "materials": materials,
+            "material_history_source": (
                 "FORMULA_ESTIMATE"
                 if has_estimated_materials
-                else
-                "REAL"
+                else "REAL"
             ),
-
-            "has_sales":
-            has_sales,
-
-            "can_delete":
-            can_delete,
-
-            "delete_block_reason":
-            (
-                "El lote ya fue utilizado en una venta."
-                if has_sales
+            "has_sales": lot.id in sale_lot_ids,
+            "has_consumption": has_consumption,
+            "can_edit": is_production_lot,
+            "can_delete": can_delete,
+            "delete_block_reason": (
+                "El lote fue generado por un ajuste de stock."
+                if not is_production_lot
                 else
                 (
                     "El lote ya tiene unidades consumidas o ajustadas."
-                    if not can_delete
+                    if has_consumption
                     else
-                    ""
+                    (
+                        "El lote no tiene detalle real de materias primas."
+                        if not materials
+                        else ""
+                    )
                 )
             )
         })
 
     return result
+
+
+@app.put("/lots/{lot_id}")
+def update_lot(
+    lot_id: int,
+    data: dict,
+    db: Session = Depends(get_db)
+):
+
+    lot = (
+        db.query(Lot)
+        .filter(
+            Lot.id == lot_id
+        )
+        .with_for_update()
+        .first()
+    )
+
+    if not lot:
+
+        return {
+            "error":
+            "Lote no encontrado"
+        }
+
+    if (lot.origin or "PRODUCTION") != "PRODUCTION":
+
+        return {
+            "error":
+            "Los lotes generados por ajustes de stock no se editan desde Producción"
+        }
+
+    formula = db.query(Formula).filter(
+        Formula.id == lot.formula_id
+    ).first()
+
+    if not formula:
+
+        return {
+            "error":
+            "No se encontró la fórmula del lote"
+        }
+
+    try:
+
+        output_type, output_item = formula_output_data(
+            db,
+            formula
+        )
+
+        old_units = float(
+            lot.units_produced or 0
+        )
+
+        old_remaining = float(
+            lot.remaining_units
+            if lot.remaining_units is not None
+            else old_units
+        )
+
+        consumed_units = max(
+            old_units - old_remaining,
+            0
+        )
+
+        new_units = float(
+            data.get(
+                "units_produced",
+                old_units
+            )
+            or
+            0
+        )
+
+        if new_units <= 0:
+
+            raise ValueError(
+                "Las unidades producidas deben ser mayores a cero"
+            )
+
+        if new_units + 0.000001 < consumed_units:
+
+            raise ValueError(
+                (
+                    f"El lote ya tiene {consumed_units:.2f} unidades utilizadas. "
+                    "No puede reducirse por debajo de esa cantidad."
+                )
+            )
+
+        unit_delta = new_units - old_units
+
+        if output_type == "PRODUCT":
+
+            if (
+                unit_delta < 0
+                and
+                float(output_item.stock or 0)
+                +
+                0.000001
+                <
+                abs(unit_delta)
+            ):
+
+                raise ValueError(
+                    "El stock actual del producto no alcanza para reducir el lote"
+                )
+
+            output_item.stock = (
+                float(output_item.stock or 0)
+                +
+                unit_delta
+            )
+
+        else:
+
+            if (
+                unit_delta < 0
+                and
+                float(output_item.stock or 0)
+                +
+                0.000001
+                <
+                abs(unit_delta)
+            ):
+
+                raise ValueError(
+                    "El stock actual del intermedio no alcanza para reducir el lote"
+                )
+
+            output_item.stock = (
+                float(output_item.stock or 0)
+                +
+                unit_delta
+            )
+
+        lot.units_produced = new_units
+        lot.remaining_units = max(
+            old_remaining + unit_delta,
+            0
+        )
+
+        lot.production_date = parse_date_value(
+            data.get(
+                "production_date",
+                lot.production_date
+            ),
+            "fecha de elaboración"
+        )
+
+        lot.expiration_date = parse_date_value(
+            data.get(
+                "expiration_date",
+                lot.expiration_date
+            ),
+            "fecha de vencimiento",
+            allow_none=True
+        )
+
+        lot.notes = str(
+            data.get(
+                "notes",
+                lot.notes or ""
+            )
+            or
+            ""
+        )
+
+        previous_labor_hours = float(
+            lot.real_labor_hours or 0
+        )
+
+        previous_labor_cost = float(
+            lot.labor_cost or 0
+        )
+
+        labor_hours_changed = (
+            "real_labor_hours" in data
+        )
+
+        lot.real_labor_hours = float(
+            data.get(
+                "real_labor_hours",
+                previous_labor_hours
+            )
+            or
+            0
+        )
+
+        if lot.real_labor_hours < 0:
+
+            raise ValueError(
+                "Las horas de trabajo no pueden ser negativas"
+            )
+
+        if "materials" in data:
+
+            existing_sources = db.execute(
+                text(
+                    """
+                    SELECT source
+                    FROM lot_materials
+                    WHERE lot_id = :lot_id
+                    """
+                ),
+                {
+                    "lot_id":
+                    lot.id
+                }
+            ).mappings().all()
+
+            if any(
+                row["source"] == "FORMULA_ESTIMATE"
+                for row in existing_sources
+            ):
+
+                raise ValueError(
+                    "Este lote es anterior al historial detallado y sus materias primas no pueden editarse"
+                )
+
+            restore_lot_material_consumption(
+                db,
+                lot.id
+            )
+
+            material_cost = consume_materials_for_lot(
+                db=db,
+                consumer_lot=lot,
+                materials_data=data.get("materials", []),
+                output_raw_material_id=(
+                    output_item.id
+                    if output_type == "RAW_MATERIAL"
+                    else None
+                )
+            )
+
+        else:
+
+            material_cost = float(
+                lot.material_cost or 0
+            )
+
+        if labor_hours_changed:
+
+            settings = db.query(Settings).first()
+
+            historical_labor_hour_cost = (
+                previous_labor_cost
+                /
+                previous_labor_hours
+                if previous_labor_hours > 0
+                else
+                float(
+                    settings.labor_hour_cost
+                    if settings
+                    else 10000
+                )
+            )
+
+            labor_cost = (
+                float(lot.real_labor_hours or 0)
+                *
+                historical_labor_hour_cost
+            )
+
+        else:
+
+            # Corregir la fecha, el vencimiento, las unidades o las notas no
+            # debe volver a valuar la mano de obra con el valor actual.
+            labor_cost = previous_labor_cost
+
+        total_cost = (
+            material_cost
+            +
+            labor_cost
+        )
+
+        lot.output_type = output_type
+        lot.output_raw_material_id = (
+            output_item.id
+            if output_type == "RAW_MATERIAL"
+            else None
+        )
+        lot.material_cost = material_cost
+        lot.labor_cost = labor_cost
+        lot.total_cost = total_cost
+        lot.unit_cost = total_cost / new_units
+        lot.inventory_unit_cost = (
+            total_cost / new_units
+            if output_type == "RAW_MATERIAL"
+            else material_cost / new_units
+        )
+        lot.status = (
+            "Disponible"
+            if float(lot.remaining_units or 0) > 0.000001
+            else "Agotado"
+        )
+
+        if output_type == "RAW_MATERIAL":
+
+            recalculate_intermediate_material_cost(
+                db,
+                output_item.id
+            )
+
+        replace_lot_production_journal(
+            db,
+            lot,
+            output_type
+        )
+
+        db.commit()
+        db.refresh(lot)
+
+        return {
+            "message":
+            f"Lote {lot.lot_number} modificado correctamente",
+            "id": lot.id,
+            "units_produced": float(lot.units_produced or 0),
+            "remaining_units": float(lot.remaining_units or 0),
+            "total_cost": round(float(lot.total_cost or 0), 2),
+            "unit_cost": round(float(lot.unit_cost or 0), 2)
+        }
+
+    except Exception as error:
+
+        db.rollback()
+
+        return {
+            "error":
+            f"No se pudo modificar el lote: {error}"
+        }
 
 
 @app.delete("/lots/{lot_id}")
@@ -6446,15 +8385,12 @@ def delete_lot(
             "Lote no encontrado"
         }
 
-    allocations = (
-        db.query(SaleLotAllocation)
-        .filter(
-            SaleLotAllocation.lot_id
-            ==
-            lot.id
-        )
-        .count()
-    )
+    if (lot.origin or "PRODUCTION") != "PRODUCTION":
+
+        return {
+            "error":
+            "Este lote pertenece a un ajuste de stock y debe eliminarse desde ese ajuste"
+        }
 
     units_produced = float(
         lot.units_produced or 0
@@ -6466,70 +8402,48 @@ def delete_lot(
         else units_produced
     )
 
+    allocations_count = (
+        db.query(SaleLotAllocation).filter(
+            SaleLotAllocation.lot_id == lot.id
+        ).count()
+        +
+        db.query(StockMovementLotAllocation).filter(
+            StockMovementLotAllocation.lot_id == lot.id
+        ).count()
+        +
+        db.query(LotMaterialSourceAllocation).filter(
+            LotMaterialSourceAllocation.source_lot_id == lot.id
+        ).count()
+    )
+
     if (
-        allocations > 0
+        allocations_count > 0
         or
         abs(
-            remaining_units
-            -
-            units_produced
-        )
-        >
-        0.000001
+            remaining_units - units_produced
+        ) > 0.000001
     ):
 
         return {
             "error":
-            (
-                "No se puede eliminar este lote porque "
-                "ya fue utilizado total o parcialmente en ventas."
-            )
+            "No se puede eliminar este lote porque ya fue utilizado total o parcialmente"
         }
 
     formula = db.query(Formula).filter(
         Formula.id == lot.formula_id
     ).first()
 
-    product = None
-
-    if formula:
-
-        product = db.query(Product).filter(
-            Product.id
-            ==
-            formula.output_product_id
-        ).first()
-
-    if not product:
+    if not formula:
 
         return {
             "error":
-            "No se encontró el producto terminado asociado al lote"
-        }
-
-    if (
-        float(product.stock or 0)
-        +
-        0.000001
-        <
-        units_produced
-    ):
-
-        return {
-            "error":
-            (
-                "No se puede eliminar el lote porque el stock actual "
-                "del producto terminado es menor que las unidades del lote."
-            )
+            "No se encontró la fórmula asociada al lote"
         }
 
     material_rows = db.execute(
         text(
             """
-            SELECT
-                raw_material_id,
-                quantity,
-                source
+            SELECT source
             FROM lot_materials
             WHERE lot_id = :lot_id
             """
@@ -6544,101 +8458,79 @@ def delete_lot(
 
         return {
             "error":
-            (
-                "Este lote no tiene guardado el detalle de materias primas "
-                "y no puede eliminarse de forma segura."
-            )
+            "Este lote no tiene detalle de materias primas y no puede eliminarse de forma segura"
         }
 
     used_estimated_history = any(
-        row["source"]
-        ==
-        "FORMULA_ESTIMATE"
+        row["source"] == "FORMULA_ESTIMATE"
         for row in material_rows
     )
 
     try:
 
-        for row in material_rows:
+        output_type, output_item = formula_output_data(
+            db,
+            formula
+        )
 
-            raw = db.query(RawMaterial).filter(
-                RawMaterial.id
-                ==
-                row["raw_material_id"]
-            ).first()
+        if (
+            float(output_item.stock or 0)
+            +
+            0.000001
+            <
+            units_produced
+        ):
 
-            if raw:
+            raise ValueError(
+                "El stock actual es menor que la cantidad producida por el lote"
+            )
 
-                raw.stock = (
-                    float(raw.stock or 0)
-                    +
-                    float(row["quantity"] or 0)
-                )
+        restore_lot_material_consumption(
+            db,
+            lot.id
+        )
 
-        product.stock = (
-            float(product.stock or 0)
+        output_item.stock = (
+            float(output_item.stock or 0)
             -
             units_produced
         )
 
-        if product.stock < 0.000001:
-
-            product.stock = max(
-                float(product.stock or 0),
-                0
-            )
-
         db.query(JournalEntry).filter(
-            JournalEntry.origin
-            ==
-            "PRODUCCION",
-            JournalEntry.origin_id
-            ==
-            lot.id
+            JournalEntry.origin == "PRODUCCION",
+            JournalEntry.origin_id == lot.id
         ).delete(
             synchronize_session=False
         )
 
         db.query(JournalEntry).filter(
             JournalEntry.origin_id.is_(None),
-            JournalEntry.concept
-            ==
-            f"Producción lote {lot.lot_number}"
+            JournalEntry.concept == f"Producción lote {lot.lot_number}"
         ).delete(
             synchronize_session=False
         )
 
-        db.execute(
-            text(
-                "DELETE FROM lot_materials WHERE lot_id = :lot_id"
-            ),
-            {
-                "lot_id":
-                lot.id
-            }
-        )
-
         db.delete(lot)
+        db.flush()
+
+        if output_type == "RAW_MATERIAL":
+
+            recalculate_intermediate_material_cost(
+                db,
+                output_item.id
+            )
 
         db.commit()
 
         return {
             "message":
             f"Lote {lot.lot_number} eliminado correctamente",
-
-            "materials_restored":
-            True,
-
-            "used_estimated_history":
-            used_estimated_history,
-
-            "warning":
-            (
-                "Las materias primas se repusieron según la fórmula actual "
-                "porque este lote es anterior al historial detallado."
+            "materials_restored": True,
+            "used_estimated_history": used_estimated_history,
+            "warning": (
+                "Las materias primas se repusieron según la estimación histórica."
                 if used_estimated_history
-                else
-                ""
+                else ""
             )
         }
 
@@ -6658,310 +8550,195 @@ def create_lot(
     db: Session = Depends(get_db)
 ):
 
-    units_produced = float(
-        lot["units_produced"]
-    )
-
-    real_labor_hours = float(
-        lot.get(
-            "real_labor_hours",
-            0
-        )
-    )
-
-    if units_produced <= 0:
-
-        return {
-            "error":
-            "Las unidades producidas deben ser mayores a cero"
-        }
-
-    material_cost = 0
-
-    materials_to_discount = []
-
-    # ==========================
-    # VALIDAR Y VALUAR MATERIAS PRIMAS
-    # ==========================
-
-    for material_data in lot.get(
-        "materials",
-        []
-    ):
-
-        raw = db.query(RawMaterial).filter(
-            RawMaterial.id
-            ==
-            material_data["raw_material_id"]
-        ).first()
-
-        if not raw:
-
-            return {
-                "error":
-                "Una de las materias primas no existe"
-            }
-
-        quantity_used = float(
-            material_data["real_quantity"]
-        )
-
-        if quantity_used <= 0:
-
-            return {
-                "error":
-                f"La cantidad usada de {raw.name} debe ser mayor a cero"
-            }
-
-        if (
-            float(raw.stock or 0)
-            +
-            0.000001
-            <
-            quantity_used
-        ):
-
-            return {
-                "error":
-                (
-                    f"Stock insuficiente de {raw.name}. "
-                    f"Disponible: {raw.stock}"
-                )
-            }
-
-        unit_material_cost = float(
-            raw.cost or 0
-        )
-
-        material_cost += (
-            quantity_used
-            *
-            unit_material_cost
-        )
-
-        materials_to_discount.append(
-            (
-                raw,
-                quantity_used,
-                unit_material_cost
-            )
-        )
-
-    settings = db.query(Settings).first()
-
-    labor_hour_cost = float(
-        settings.labor_hour_cost
-        if settings
-        else 10000
-    )
-
-    labor_cost = (
-        real_labor_hours
-        *
-        labor_hour_cost
-    )
-
-    full_total_cost = (
-        material_cost
-        +
-        labor_cost
-    )
-
-    full_unit_cost = (
-        full_total_cost
-        /
-        units_produced
-    )
-
-    inventory_unit_cost = (
-        material_cost
-        /
-        units_produced
-    )
-
-    formula = db.query(Formula).filter(
-        Formula.id == lot["formula_id"]
-    ).first()
-
-    if not formula:
-
-        return {
-            "error":
-            "Fórmula no encontrada"
-        }
-
-    product = db.query(Product).filter(
-        Product.id == formula.output_product_id
-    ).first()
-
-    if not product:
-
-        return {
-            "error":
-            "La fórmula no tiene un producto terminado válido"
-        }
-
     try:
 
-        lot_number = (
-            take_next_document_number(
-                db,
-                "LOT"
+        units_produced = float(
+            lot.get(
+                "units_produced",
+                0
             )
+            or
+            0
+        )
+
+        real_labor_hours = float(
+            lot.get(
+                "real_labor_hours",
+                0
+            )
+            or
+            0
+        )
+
+        if units_produced <= 0:
+
+            raise ValueError(
+                "Las unidades producidas deben ser mayores a cero"
+            )
+
+        formula = db.query(Formula).filter(
+            Formula.id == int(lot["formula_id"])
+        ).first()
+
+        if not formula:
+
+            raise ValueError(
+                "Fórmula no encontrada"
+            )
+
+        output_type, output_item = formula_output_data(
+            db,
+            formula
+        )
+
+        lot_number = take_next_document_number(
+            db,
+            "LOT"
         )
 
         item = Lot(
-
             lot_number=lot_number,
-
-            formula_id=lot["formula_id"],
-
-            production_date=lot["production_date"],
-
+            formula_id=formula.id,
+            output_type=output_type,
+            output_raw_material_id=(
+                output_item.id
+                if output_type == "RAW_MATERIAL"
+                else None
+            ),
+            origin="PRODUCTION",
+            production_date=parse_date_value(
+                lot.get("production_date"),
+                "fecha de elaboración"
+            ),
+            expiration_date=parse_date_value(
+                lot.get("expiration_date"),
+                "fecha de vencimiento",
+                allow_none=True
+            ),
             units_produced=units_produced,
-
             remaining_units=units_produced,
-
             real_labor_hours=real_labor_hours,
-
-            material_cost=material_cost,
-
-            labor_cost=labor_cost,
-
-            total_cost=full_total_cost,
-
-            unit_cost=full_unit_cost,
-
-            inventory_unit_cost=inventory_unit_cost,
-
+            material_cost=0,
+            labor_cost=0,
+            total_cost=0,
+            unit_cost=0,
+            inventory_unit_cost=0,
             notes=lot.get(
                 "notes",
                 ""
-            )
-
+            ),
+            status="Disponible"
         )
 
         db.add(item)
-
         db.flush()
 
-        # ==========================
-        # DESCONTAR MATERIAS PRIMAS
-        # ==========================
-
-        for (
-            raw,
-            quantity_used,
-            unit_material_cost
-        ) in materials_to_discount:
-
-            raw.stock = (
-                float(raw.stock or 0)
-                -
-                quantity_used
+        material_cost = consume_materials_for_lot(
+            db=db,
+            consumer_lot=item,
+            materials_data=lot.get("materials", []),
+            output_raw_material_id=(
+                output_item.id
+                if output_type == "RAW_MATERIAL"
+                else None
             )
+        )
 
-            db.execute(
-                text(
-                    """
-                    INSERT INTO lot_materials (
-                        lot_id,
-                        raw_material_id,
-                        quantity,
-                        unit_cost,
-                        subtotal_cost,
-                        source
-                    )
-                    VALUES (
-                        :lot_id,
-                        :raw_material_id,
-                        :quantity,
-                        :unit_cost,
-                        :subtotal_cost,
-                        'REAL'
-                    )
-                    """
-                ),
-                {
-                    "lot_id":
-                    item.id,
+        settings = db.query(Settings).first()
 
-                    "raw_material_id":
-                    raw.id,
+        labor_hour_cost = float(
+            settings.labor_hour_cost
+            if settings
+            else 10000
+        )
 
-                    "quantity":
-                    quantity_used,
+        labor_cost = (
+            real_labor_hours
+            *
+            labor_hour_cost
+        )
 
-                    "unit_cost":
-                    unit_material_cost,
-
-                    "subtotal_cost":
-                    quantity_used
-                    *
-                    unit_material_cost
-                }
-            )
-
-        # ==========================
-        # AUMENTAR PRODUCTO TERMINADO
-        # ==========================
-
-        product.stock = (
-            float(product.stock or 0)
+        total_cost = (
+            material_cost
             +
+            labor_cost
+        )
+
+        full_unit_cost = (
+            total_cost
+            /
             units_produced
         )
 
-        # ==========================
-        # ASIENTO AUTOMÁTICO DE PRODUCCIÓN
-        # ==========================
+        inventory_unit_cost = (
+            full_unit_cost
+            if output_type == "RAW_MATERIAL"
+            else material_cost / units_produced
+        )
 
-        registrar_asiento_produccion(
+        item.material_cost = material_cost
+        item.labor_cost = labor_cost
+        item.total_cost = total_cost
+        item.unit_cost = full_unit_cost
+        item.inventory_unit_cost = inventory_unit_cost
 
-            db=db,
+        if output_type == "PRODUCT":
 
-            fecha=lot["production_date"],
+            output_item.stock = (
+                float(output_item.stock or 0)
+                +
+                units_produced
+            )
 
-            concepto=(
-                f"Producción lote {lot_number}"
-            ),
+        else:
 
-            costo_materiales=material_cost,
+            old_stock = float(
+                output_item.stock or 0
+            )
 
-            costo_mano_obra=labor_cost,
+            old_value = (
+                old_stock
+                *
+                float(output_item.cost or 0)
+            )
 
-            origin_id=item.id
+            output_item.stock = (
+                old_stock
+                +
+                units_produced
+            )
 
+            output_item.cost = (
+                old_value
+                +
+                total_cost
+            ) / output_item.stock
+
+            output_item.is_intermediate = 1
+
+        replace_lot_production_journal(
+            db,
+            item,
+            output_type
         )
 
         db.commit()
-
         db.refresh(item)
 
         return {
-
             "id": item.id,
-
             "lot_number": item.lot_number,
-
-            "material_cost":
-            round(material_cost, 2),
-
-            "labor_cost":
-            round(labor_cost, 2),
-
-            "total_cost":
-            round(full_total_cost, 2),
-
-            "unit_cost":
-            round(full_unit_cost, 2),
-
-            "inventory_unit_cost":
-            round(inventory_unit_cost, 2),
-
-            "message":
-            "Lote guardado y contabilizado correctamente"
-
+            "output_type": output_type,
+            "material_cost": round(material_cost, 2),
+            "labor_cost": round(labor_cost, 2),
+            "total_cost": round(total_cost, 2),
+            "unit_cost": round(full_unit_cost, 2),
+            "inventory_unit_cost": round(inventory_unit_cost, 2),
+            "message": (
+                "Lote de materia prima elaborada guardado correctamente"
+                if output_type == "RAW_MATERIAL"
+                else "Lote guardado y contabilizado correctamente"
+            )
         }
 
     except Exception as error:
@@ -7166,13 +8943,85 @@ def get_raw_materials(
     db: Session = Depends(get_db)
 ):
 
-    return (
+    materials = (
         db.query(RawMaterial)
         .order_by(
             RawMaterial.name.asc()
         )
         .all()
     )
+
+    return [
+        {
+            "id": material.id,
+            "code": material.code or "",
+            "name": material.name,
+            "category": material.category or "",
+            "unit": material.unit or "",
+            "stock": round(
+                float(material.stock or 0),
+                2
+            ),
+            "minimum_stock": round(
+                float(material.minimum_stock or 0),
+                2
+            ),
+            "cost": float(material.cost or 0),
+            "supplier": material.supplier or "",
+            "location": material.location or "",
+            "is_intermediate": int(
+                material.is_intermediate or 0
+            )
+        }
+        for material in materials
+    ]
+
+
+def normalized_material_name(
+    value
+):
+
+    return " ".join(
+        str(value or "")
+        .strip()
+        .lower()
+        .split()
+    )
+
+
+def ensure_unique_material_name(
+    db,
+    name,
+    exclude_id=None
+):
+
+    normalized = normalized_material_name(
+        name
+    )
+
+    if not normalized:
+
+        raise ValueError(
+            "El nombre de la materia prima es obligatorio"
+        )
+
+    for existing in db.query(RawMaterial).all():
+
+        if (
+            exclude_id is not None
+            and
+            existing.id == exclude_id
+        ):
+
+            continue
+
+        if normalized_material_name(
+            existing.name
+        ) == normalized:
+
+            raise ValueError(
+                "Ya existe una materia prima con ese nombre"
+            )
 
 
 @app.post("/raw-materials")
@@ -7181,23 +9030,54 @@ def create_raw_material(
     db: Session = Depends(get_db)
 ):
 
-    item = RawMaterial(
-        code=material.code,
-        name=material.name,
-        category=material.category,
-        unit=material.unit,
-        stock=material.stock,
-        minimum_stock=material.minimum_stock,
-        cost=material.cost,
-        supplier=material.supplier,
-        location=material.location
-    )
+    try:
 
-    db.add(item)
-    db.commit()
-    db.refresh(item)
+        ensure_unique_material_name(
+            db,
+            material.name
+        )
 
-    return item
+        internal_code = str(
+            material.code or ""
+        ).strip()
+
+        if not internal_code:
+
+            internal_code = (
+                "RM-"
+                +
+                uuid4().hex[:10].upper()
+            )
+
+        item = RawMaterial(
+            code=internal_code,
+            name=str(material.name).strip(),
+            category=material.category,
+            unit=material.unit,
+            stock=material.stock,
+            minimum_stock=material.minimum_stock,
+            cost=material.cost,
+            supplier=material.supplier,
+            location=material.location,
+            is_intermediate=int(
+                material.is_intermediate or 0
+            )
+        )
+
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+
+        return item
+
+    except Exception as error:
+
+        db.rollback()
+
+        return {
+            "error":
+            f"No se pudo guardar la materia prima: {error}"
+        }
 
 
 @app.put("/raw-materials/{material_id}")
@@ -7212,22 +9092,62 @@ def update_raw_material(
     ).first()
 
     if not item:
-        return {"error": "Materia prima no encontrada"}
 
-    item.code = material.code
-    item.name = material.name
-    item.category = material.category
-    item.unit = material.unit
-    item.stock = material.stock
-    item.minimum_stock = material.minimum_stock
-    item.cost = material.cost
-    item.supplier = material.supplier
-    item.location = material.location
+        return {
+            "error":
+            "Materia prima no encontrada"
+        }
 
-    db.commit()
-    db.refresh(item)
+    try:
 
-    return item
+        ensure_unique_material_name(
+            db,
+            material.name,
+            exclude_id=item.id
+        )
+
+        supplied_code = str(
+            material.code or ""
+        ).strip()
+
+        if supplied_code:
+
+            item.code = supplied_code
+
+        elif not item.code:
+
+            item.code = (
+                "RM-"
+                +
+                uuid4().hex[:10].upper()
+            )
+
+        item.name = str(material.name).strip()
+        item.category = material.category
+        item.unit = material.unit
+        item.stock = material.stock
+        item.minimum_stock = material.minimum_stock
+        item.cost = material.cost
+        item.supplier = material.supplier
+        item.location = material.location
+        item.is_intermediate = max(
+            int(item.is_intermediate or 0),
+            int(material.is_intermediate or 0)
+        )
+
+        db.commit()
+        db.refresh(item)
+
+        return item
+
+    except Exception as error:
+
+        db.rollback()
+
+        return {
+            "error":
+            f"No se pudo modificar la materia prima: {error}"
+        }
 
 
 @app.delete("/raw-materials/{material_id}")

@@ -13,15 +13,16 @@ class ProductCreate(BaseModel):
 # ================= MATERIAS PRIMAS =================
 
 class RawMaterialCreate(BaseModel):
-    code: str
+    code: Optional[str] = ""
     name: str
-    category: str
+    category: str = ""
     unit: str
-    stock: float
-    minimum_stock: float
-    cost: float
-    supplier: str
-    location: str
+    stock: float = 0
+    minimum_stock: float = 0
+    cost: float = 0
+    supplier: str = ""
+    location: str = ""
+    is_intermediate: int = 0
 
 
 # ================= FORMULAS =================
@@ -29,6 +30,8 @@ class RawMaterialCreate(BaseModel):
 class FormulaCreate(BaseModel):
     name: str
     output_product_id: Optional[int] = None
+    output_raw_material_id: Optional[int] = None
+    output_type: str = "PRODUCT"
     batch_size: float
     labor_hours: float = 0
     units_produced: float = 1
