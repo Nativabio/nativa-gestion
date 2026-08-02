@@ -72,6 +72,8 @@ class Sale(Base):
 
     total = Column(Float, default=0)
 
+    shipping_cost = Column(Float, default=0)
+
     amount_paid = Column(Float, default=0)
 
     balance = Column(Float, default=0)
@@ -85,6 +87,11 @@ class Sale(Base):
 
     payments = relationship(
         "SalePayment",
+        back_populates="sale",
+        cascade="all, delete-orphan"
+    )
+    returned_containers = relationship(
+        "SaleReturnedContainer",
         back_populates="sale",
         cascade="all, delete-orphan"
     )
@@ -137,6 +144,31 @@ class SalePayment(Base):
         "Sale",
         back_populates="payments"
     )
+
+
+class SaleReturnedContainer(Base):
+    __tablename__ = "sale_returned_containers"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    sale_id = Column(
+        Integer,
+        ForeignKey("sales.id", ondelete="CASCADE")
+    )
+
+    raw_material_id = Column(
+        Integer,
+        ForeignKey("raw_materials.id")
+    )
+
+    quantity = Column(Float, default=0)
+
+    sale = relationship(
+        "Sale",
+        back_populates="returned_containers"
+    )
+
+    raw_material = relationship("RawMaterial")
 
 
 class SaleLotAllocation(Base):

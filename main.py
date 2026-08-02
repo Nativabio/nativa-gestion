@@ -23,6 +23,7 @@ from models import (
     Sale,
     SaleItem,
     SalePayment,
+    SaleReturnedContainer,
     SaleLotAllocation,
     StockMovement,
     StockMovementItem,
@@ -82,6 +83,12 @@ with engine.connect() as conn:
 
     conn.execute(
         text(
+            "ALTER TABLE sales ADD COLUMN IF NOT EXISTS shipping_cost FLOAT DEFAULT 0"
+        )
+    )
+
+    conn.execute(
+        text(
             "ALTER TABLE sales ADD COLUMN IF NOT EXISTS amount_paid FLOAT DEFAULT 0"
         )
     )
@@ -109,6 +116,19 @@ with engine.connect() as conn:
                 payment_method VARCHAR,
                 amount FLOAT DEFAULT 0,
                 notes VARCHAR DEFAULT ''
+            )
+            """
+        )
+    )
+
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS sale_returned_containers (
+                id SERIAL PRIMARY KEY,
+                sale_id INTEGER REFERENCES sales(id) ON DELETE CASCADE,
+                raw_material_id INTEGER REFERENCES raw_materials(id),
+                quantity FLOAT DEFAULT 0
             )
             """
         )
@@ -501,6 +521,13 @@ def create_default_accounts():
         {
             "code": "1.1.04",
             "name": "Cuentas a Cobrar",
+            "type": "ACTIVO",
+            "category": "ACTIVO"
+        },
+
+        {
+            "code": "1.1.05",
+            "name": "Tarjetas a cobrar",
             "type": "ACTIVO",
             "category": "ACTIVO"
         },
@@ -2107,6 +2134,8 @@ def create_sale(
 
         total=0,
 
+        shipping_cost=0,
+
         amount_paid=0,
 
         balance=0,
@@ -2150,6 +2179,20 @@ def sale_payment_account(
             "Cuentas a Cobrar"
         )
 
+    normalized_method = str(
+        payment_method or ""
+    ).strip().lower()
+
+    if normalized_method in {
+        "tarjeta de crédito",
+        "tarjeta de credito"
+    }:
+
+        return (
+            "1.1.05",
+            "Tarjetas a cobrar"
+        )
+
     if payment_method == "Banco":
 
         return (
@@ -2170,10 +2213,162 @@ def sale_payment_account(
     )
 
 
+def apply_returned_containers(
+    db,
+    sale,
+    containers_data
+):
+
+    if (
+        containers_data is None
+        or
+        containers_data == ""
+    ):
+
+        return
+
+    if not isinstance(
+        containers_data,
+        list
+    ):
+
+        raise ValueError(
+            "Los envases devueltos no tienen un formato válido"
+        )
+
+    quantities_by_material = {}
+
+    for item in containers_data:
+
+        raw_material_id = int(
+            item.get(
+                "raw_material_id"
+            )
+        )
+
+        quantity = float(
+            item.get(
+                "quantity",
+                0
+            )
+            or
+            0
+        )
+
+        if quantity <= 0:
+
+            raise ValueError(
+                "La cantidad de envases devueltos debe ser mayor a cero"
+            )
+
+        quantities_by_material[raw_material_id] = (
+            quantities_by_material.get(
+                raw_material_id,
+                0
+            )
+            +
+            quantity
+        )
+
+    for raw_material_id, quantity in (
+        quantities_by_material.items()
+    ):
+
+        material = (
+            db.query(RawMaterial)
+            .filter(
+                RawMaterial.id == raw_material_id
+            )
+            .with_for_update()
+            .first()
+        )
+
+        if not material:
+
+            raise ValueError(
+                "Uno de los envases devueltos no existe en materias primas"
+            )
+
+        material.stock = (
+            float(material.stock or 0)
+            +
+            quantity
+        )
+
+        db.add(
+            SaleReturnedContainer(
+                sale_id=sale.id,
+                raw_material_id=material.id,
+                quantity=quantity
+            )
+        )
+
+
+def restore_returned_containers(
+    db,
+    sale
+):
+
+    returned_items = (
+        db.query(SaleReturnedContainer)
+        .filter(
+            SaleReturnedContainer.sale_id
+            ==
+            sale.id
+        )
+        .all()
+    )
+
+    for returned_item in returned_items:
+
+        material = (
+            db.query(RawMaterial)
+            .filter(
+                RawMaterial.id
+                ==
+                returned_item.raw_material_id
+            )
+            .with_for_update()
+            .first()
+        )
+
+        quantity = float(
+            returned_item.quantity or 0
+        )
+
+        if material:
+
+            if (
+                float(material.stock or 0)
+                +
+                0.000001
+                <
+                quantity
+            ):
+
+                raise ValueError(
+                    f"No se puede revertir la devolución de {material.name}: "
+                    "ese stock ya fue utilizado"
+                )
+
+            material.stock = (
+                float(material.stock or 0)
+                -
+                quantity
+            )
+
+        db.delete(returned_item)
+
+
 def restore_sale_details(
     db,
     sale
 ):
+
+    restore_returned_containers(
+        db,
+        sale
+    )
 
     sale_items = db.query(SaleItem).filter(
         SaleItem.sale_id == sale.id
@@ -2244,6 +2439,7 @@ def restore_sale_details(
     )
 
     sale.total = 0
+    sale.shipping_cost = 0
 
     db.flush()
 
@@ -2251,8 +2447,21 @@ def restore_sale_details(
 def apply_sale_items(
     db,
     sale,
-    items_data
+    items_data,
+    shipping_cost=0,
+    returned_containers=None
 ):
+
+
+    shipping_cost_value = float(
+        shipping_cost or 0
+    )
+
+    if shipping_cost_value < 0:
+
+        raise ValueError(
+            "El costo de envío no puede ser negativo"
+        )
 
     if not isinstance(items_data, list) or not items_data:
 
@@ -2508,6 +2717,15 @@ def apply_sale_items(
         sale.total += subtotal
         total_cost_of_sale += item_cost
 
+    sale.shipping_cost = shipping_cost_value
+    sale.total += shipping_cost_value
+
+    apply_returned_containers(
+        db,
+        sale,
+        returned_containers or []
+    )
+
     payment_code, payment_name = (
         sale_payment_account(
             sale.payment_method
@@ -2578,7 +2796,9 @@ def create_sale_items(
             apply_sale_items(
                 db,
                 sale,
-                data.get("items", [])
+                data.get("items", []),
+                data.get("shipping_cost", 0),
+                data.get("returned_containers", [])
             )
         )
 
@@ -2707,7 +2927,9 @@ def update_sale(
             apply_sale_items(
                 db,
                 sale,
-                data.get("items", [])
+                data.get("items", []),
+                data.get("shipping_cost", 0),
+                data.get("returned_containers", [])
             )
         )
 
@@ -2771,12 +2993,48 @@ def get_sales(
 
     sale_items = db.query(SaleItem).all()
     sale_payments = db.query(SalePayment).all()
+    sale_returned_items = db.query(SaleReturnedContainer).all()
     products = db.query(Product).all()
+    raw_materials = db.query(RawMaterial).all()
 
     product_name_by_id = {
         product.id: product.name
         for product in products
     }
+
+    raw_material_by_id = {
+        material.id: material
+        for material in raw_materials
+    }
+
+    returned_by_sale = {}
+
+    for returned_item in sale_returned_items:
+
+        material = raw_material_by_id.get(
+            returned_item.raw_material_id
+        )
+
+        returned_by_sale.setdefault(
+            returned_item.sale_id,
+            []
+        ).append({
+            "id": returned_item.id,
+            "raw_material_id": returned_item.raw_material_id,
+            "name": (
+                material.name
+                if material
+                else
+                "Envase sin nombre"
+            ),
+            "unit": (
+                material.unit
+                if material
+                else
+                ""
+            ),
+            "quantity": float(returned_item.quantity or 0)
+        })
 
     items_by_sale = {}
 
@@ -2828,11 +3086,16 @@ def get_sales(
             "client": sale.client,
             "date": sale.date,
             "payment_method": sale.payment_method,
+            "shipping_cost": float(sale.shipping_cost or 0),
             "total": float(sale.total or 0),
             "amount_paid": float(sale.amount_paid or 0),
             "balance": float(sale.balance or 0),
             "payment_status": sale.payment_status or "PAGADA",
             "items": items_by_sale.get(
+                sale.id,
+                []
+            ),
+            "returned_containers": returned_by_sale.get(
                 sale.id,
                 []
             ),
@@ -4899,11 +5162,51 @@ def apply_purchase_contents(
 
         if adjust_stock:
 
-            material.stock = (
-                float(material.stock or 0)
-                +
+            purchased_quantity = float(
                 item["quantity"]
+                or
+                0
             )
+
+            if purchased_quantity <= 0:
+
+                raise ValueError(
+                    f"La cantidad comprada de {material.name} debe ser mayor a cero"
+                )
+
+            previous_stock = max(
+                float(material.stock or 0),
+                0
+            )
+
+            previous_unit_cost = max(
+                float(material.cost or 0),
+                0
+            )
+
+            previous_stock_value = (
+                previous_stock
+                *
+                previous_unit_cost
+            )
+
+            new_stock = (
+                previous_stock
+                +
+                purchased_quantity
+            )
+
+            material.cost = (
+                (
+                    previous_stock_value
+                    +
+                    final_price
+                )
+                /
+                new_stock
+            )
+
+            material.stock = new_stock
 
         material_total += final_price
         affected_material_ids.add(material.id)
@@ -5023,10 +5326,12 @@ def apply_purchase_contents(
 
     db.flush()
 
-    recalculate_raw_material_costs(
-        db,
-        affected_material_ids
-    )
+    if not adjust_stock:
+
+        recalculate_raw_material_costs(
+            db,
+            affected_material_ids
+        )
 
     return (
         total,
