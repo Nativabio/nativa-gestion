@@ -7182,13 +7182,102 @@ def get_formulas(
     db: Session = Depends(get_db)
 ):
 
-    return (
+    formulas = (
         db.query(Formula)
         .order_by(
             Formula.name.asc()
         )
         .all()
     )
+
+    settings = db.query(Settings).first()
+
+    labor_hour_cost = float(
+        settings.labor_hour_cost
+        if settings
+        else 10000
+    )
+
+    for formula in formulas:
+
+        formula_items = (
+            db.query(FormulaItem)
+            .options(
+                joinedload(
+                    FormulaItem.raw_material
+                )
+            )
+            .filter(
+                FormulaItem.formula_id
+                ==
+                formula.id
+            )
+            .all()
+        )
+
+        material_cost = sum(
+            float(item.quantity or 0)
+            *
+            float(
+                item.raw_material.cost or 0
+            )
+            for item in formula_items
+            if item.raw_material
+        )
+
+        labor_cost = (
+            float(formula.labor_hours or 0)
+            *
+            labor_hour_cost
+        )
+
+        total_cost = (
+            material_cost
+            +
+            labor_cost
+        )
+
+        units_produced = float(
+            formula.units_produced or 0
+        )
+
+        unit_cost = (
+            total_cost / units_produced
+            if units_produced > 0
+            else 0
+        )
+
+        margin = float(
+            formula.margin_percent
+            if formula.margin_percent is not None
+            else 40
+        )
+
+        divisor = (
+            1
+            -
+            margin / 100
+        )
+
+        suggested_price = (
+            unit_cost / divisor
+            if divisor > 0
+            else 0
+        )
+
+        # Se agregan como datos calculados para mostrarlos en el listado
+        # sin modificar la fórmula ni guardar valores duplicados.
+        formula.unit_cost = round(
+            unit_cost,
+            2
+        )
+
+        formula.suggested_price = round(
+            suggested_price,
+            2
+        )
+
+    return formulas
 
 
 def validated_formula_margin(
@@ -7810,28 +7899,71 @@ def consume_materials_for_lot(
             "Agregá al menos una materia prima al lote"
         )
 
-    material_cost = 0
-    affected_intermediate_ids = set()
+    # Se agrupan cantidades repetidas. Esto permite recibir tanto los
+    # ingredientes originales de la fórmula como ingredientes extra.
+    quantities_by_material = {}
 
     for material_data in materials_data:
 
-        raw_material_id = int(
-            material_data.get(
-                "raw_material_id"
-            )
-        )
+        try:
 
-        quantity_used = float(
-            material_data.get(
-                "real_quantity",
+            raw_material_id = int(
                 material_data.get(
-                    "quantity",
-                    0
+                    "raw_material_id"
                 )
             )
-            or
-            0
+
+            quantity_used = float(
+                material_data.get(
+                    "real_quantity",
+                    material_data.get(
+                        "quantity",
+                        0
+                    )
+                )
+                or
+                0
+            )
+
+        except (
+            TypeError,
+            ValueError
+        ) as error:
+
+            raise ValueError(
+                "Hay una materia prima o una cantidad inválida"
+            ) from error
+
+        if quantity_used < 0:
+
+            raise ValueError(
+                "Las cantidades usadas no pueden ser negativas"
+            )
+
+        quantities_by_material[raw_material_id] = (
+            quantities_by_material.get(
+                raw_material_id,
+                0
+            )
+            +
+            quantity_used
         )
+
+    if not any(
+        quantity > 0
+        for quantity in quantities_by_material.values()
+    ):
+
+        raise ValueError(
+            "Al menos una materia prima debe tener una cantidad mayor a cero"
+        )
+
+    material_cost = 0
+    affected_intermediate_ids = set()
+
+    for raw_material_id, quantity_used in (
+        quantities_by_material.items()
+    ):
 
         raw = (
             db.query(RawMaterial)
@@ -7848,12 +7980,6 @@ def consume_materials_for_lot(
                 "Una de las materias primas no existe"
             )
 
-        if quantity_used <= 0:
-
-            raise ValueError(
-                f"La cantidad usada de {raw.name} debe ser mayor a cero"
-            )
-
         if (
             output_raw_material_id
             and
@@ -7863,6 +7989,45 @@ def consume_materials_for_lot(
             raise ValueError(
                 "Una materia prima elaborada no puede usarse a sí misma como ingrediente"
             )
+
+        # Una cantidad 0 representa un ingrediente omitido en este lote.
+        # Se guarda en el historial, pero no descuenta stock ni suma costo.
+        if quantity_used == 0:
+
+            db.execute(
+                text(
+                    """
+                    INSERT INTO lot_materials (
+                        lot_id,
+                        raw_material_id,
+                        quantity,
+                        unit_cost,
+                        subtotal_cost,
+                        source
+                    )
+                    VALUES (
+                        :lot_id,
+                        :raw_material_id,
+                        0,
+                        :unit_cost,
+                        0,
+                        'REAL'
+                    )
+                    """
+                ),
+                {
+                    "lot_id":
+                    consumer_lot.id,
+
+                    "raw_material_id":
+                    raw.id,
+
+                    "unit_cost":
+                    float(raw.cost or 0)
+                }
+            )
+
+            continue
 
         if (
             float(raw.stock or 0)
