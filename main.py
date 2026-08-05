@@ -136,6 +136,21 @@ with engine.connect() as conn:
 
     conn.execute(
         text(
+            """
+            CREATE TABLE IF NOT EXISTS sale_packaging_items (
+                id SERIAL PRIMARY KEY,
+                sale_id INTEGER REFERENCES sales(id) ON DELETE CASCADE,
+                raw_material_id INTEGER REFERENCES raw_materials(id),
+                quantity FLOAT DEFAULT 0,
+                unit_cost FLOAT DEFAULT 0,
+                subtotal_cost FLOAT DEFAULT 0
+            )
+            """
+        )
+    )
+
+    conn.execute(
+        text(
             "ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_method VARCHAR"
         )
     )
@@ -582,6 +597,13 @@ def create_default_accounts():
         },
 
         {
+            "code": "5.1.02",
+            "name": "Packaging",
+            "type": "COSTO",
+            "category": "COSTO"
+        },
+
+        {
             "code": "5.2.01",
             "name": "Gasto de Mano de Obra",
             "type": "GASTO",
@@ -689,6 +711,12 @@ def infer_journal_origin(
     normalized = str(
         concept or ""
     ).strip().lower()
+
+    if normalized.startswith(
+        "packaging venta"
+    ):
+
+        return "PACKAGING"
 
     if normalized.startswith(
         "costo de venta"
@@ -2360,10 +2388,242 @@ def restore_returned_containers(
         db.delete(returned_item)
 
 
+def restore_sale_packaging(
+    db,
+    sale
+):
+
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                raw_material_id,
+                quantity
+            FROM sale_packaging_items
+            WHERE sale_id = :sale_id
+            """
+        ),
+        {
+            "sale_id":
+            sale.id
+        }
+    ).mappings().all()
+
+    for row in rows:
+
+        material = (
+            db.query(RawMaterial)
+            .filter(
+                RawMaterial.id
+                ==
+                row["raw_material_id"]
+            )
+            .with_for_update()
+            .first()
+        )
+
+        if material:
+
+            material.stock = (
+                float(material.stock or 0)
+                +
+                float(row["quantity"] or 0)
+            )
+
+    db.execute(
+        text(
+            "DELETE FROM sale_packaging_items WHERE sale_id = :sale_id"
+        ),
+        {
+            "sale_id":
+            sale.id
+        }
+    )
+
+
+def apply_sale_packaging(
+    db,
+    sale,
+    packaging_data
+):
+
+    if (
+        packaging_data is None
+        or
+        packaging_data == ""
+    ):
+
+        return 0
+
+    if not isinstance(
+        packaging_data,
+        list
+    ):
+
+        raise ValueError(
+            "El packaging no tiene un formato válido"
+        )
+
+    quantities_by_material = {}
+
+    for item in packaging_data:
+
+        raw_material_id = int(
+            item.get(
+                "raw_material_id"
+            )
+        )
+
+        quantity = float(
+            item.get(
+                "quantity",
+                0
+            )
+            or
+            0
+        )
+
+        if quantity <= 0:
+
+            raise ValueError(
+                "La cantidad de packaging debe ser mayor a cero"
+            )
+
+        quantities_by_material[raw_material_id] = (
+            quantities_by_material.get(
+                raw_material_id,
+                0
+            )
+            +
+            quantity
+        )
+
+    total_packaging_cost = 0
+
+    for raw_material_id, quantity in (
+        quantities_by_material.items()
+    ):
+
+        material = (
+            db.query(RawMaterial)
+            .filter(
+                RawMaterial.id == raw_material_id
+            )
+            .with_for_update()
+            .first()
+        )
+
+        if not material:
+
+            raise ValueError(
+                "Uno de los insumos de packaging no existe"
+            )
+
+        if str(
+            material.category or ""
+        ).strip().lower() != "packaging":
+
+            raise ValueError(
+                f"{material.name} no está categorizado como Packaging"
+            )
+
+        if (
+            float(material.stock or 0)
+            +
+            0.000001
+            <
+            quantity
+        ):
+
+            raise ValueError(
+                (
+                    f"Stock insuficiente de {material.name}. "
+                    f"Disponible: {float(material.stock or 0):.2f}"
+                )
+            )
+
+        unit_cost = float(
+            material.cost or 0
+        )
+
+        subtotal_cost = (
+            quantity
+            *
+            unit_cost
+        )
+
+        material.stock = (
+            float(material.stock or 0)
+            -
+            quantity
+        )
+
+        db.execute(
+            text(
+                """
+                INSERT INTO sale_packaging_items (
+                    sale_id,
+                    raw_material_id,
+                    quantity,
+                    unit_cost,
+                    subtotal_cost
+                )
+                VALUES (
+                    :sale_id,
+                    :raw_material_id,
+                    :quantity,
+                    :unit_cost,
+                    :subtotal_cost
+                )
+                """
+            ),
+            {
+                "sale_id":
+                sale.id,
+
+                "raw_material_id":
+                material.id,
+
+                "quantity":
+                quantity,
+
+                "unit_cost":
+                unit_cost,
+
+                "subtotal_cost":
+                subtotal_cost
+            }
+        )
+
+        total_packaging_cost += subtotal_cost
+
+    if total_packaging_cost > 0:
+
+        registrar_asiento(
+            db=db,
+            fecha=sale.date,
+            concepto=f"Packaging venta {sale.number}",
+            debe_codigo="5.1.02",
+            debe_nombre="Packaging",
+            haber_codigo="1.2.01",
+            haber_nombre="Materia Prima",
+            importe=total_packaging_cost,
+            origin="PACKAGING",
+            origin_id=sale.id
+        )
+
+    return total_packaging_cost
+
+
 def restore_sale_details(
     db,
     sale
 ):
+
+    restore_sale_packaging(
+        db,
+        sale
+    )
 
     restore_returned_containers(
         db,
@@ -2422,7 +2682,8 @@ def restore_sale_details(
         JournalEntry.origin_id == sale.id,
         JournalEntry.origin.in_([
             "VENTA",
-            "CMV"
+            "CMV",
+            "PACKAGING"
         ])
     ).delete(
         synchronize_session=False
@@ -2432,7 +2693,8 @@ def restore_sale_details(
         JournalEntry.origin_id.is_(None),
         JournalEntry.concept.in_([
             f"Venta {sale.number}",
-            f"Costo de venta {sale.number}"
+            f"Costo de venta {sale.number}",
+            f"Packaging venta {sale.number}"
         ])
     ).delete(
         synchronize_session=False
@@ -2449,7 +2711,8 @@ def apply_sale_items(
     sale,
     items_data,
     shipping_cost=0,
-    returned_containers=None
+    returned_containers=None,
+    packaging_items=None
 ):
 
 
@@ -2726,6 +2989,12 @@ def apply_sale_items(
         returned_containers or []
     )
 
+    packaging_cost = apply_sale_packaging(
+        db,
+        sale,
+        packaging_items or []
+    )
+
     payment_code, payment_name = (
         sale_payment_account(
             sale.payment_method
@@ -2769,6 +3038,7 @@ def apply_sale_items(
 
     return (
         total_cost_of_sale,
+        packaging_cost,
         zero_cost_lots
     )
 
@@ -2792,13 +3062,14 @@ def create_sale_items(
 
     try:
 
-        total_cost, zero_cost_lots = (
+        total_cost, packaging_cost, zero_cost_lots = (
             apply_sale_items(
                 db,
                 sale,
                 data.get("items", []),
                 data.get("shipping_cost", 0),
-                data.get("returned_containers", [])
+                data.get("returned_containers", []),
+                data.get("packaging_items", [])
             )
         )
 
@@ -2807,8 +3078,14 @@ def create_sale_items(
         response = {
             "mensaje":
             "Venta guardada correctamente",
+            "costo_productos":
+            round(total_cost, 2),
+
+            "costo_packaging":
+            round(packaging_cost, 2),
+
             "costo_venta":
-            round(total_cost, 2)
+            round(total_cost + packaging_cost, 2)
         }
 
         if zero_cost_lots:
@@ -2923,13 +3200,14 @@ def update_sale(
 
         sale.payment_method = requested_payment_method
 
-        total_cost, zero_cost_lots = (
+        total_cost, packaging_cost, zero_cost_lots = (
             apply_sale_items(
                 db,
                 sale,
                 data.get("items", []),
                 data.get("shipping_cost", 0),
-                data.get("returned_containers", [])
+                data.get("returned_containers", []),
+                data.get("packaging_items", [])
             )
         )
 
@@ -2949,8 +3227,14 @@ def update_sale(
         response = {
             "mensaje":
             f"Venta {sale.number} modificada correctamente",
+            "costo_productos":
+            round(total_cost, 2),
+
+            "costo_packaging":
+            round(packaging_cost, 2),
+
             "costo_venta":
-            round(total_cost, 2)
+            round(total_cost + packaging_cost, 2)
         }
 
         if zero_cost_lots:
@@ -2994,6 +3278,23 @@ def get_sales(
     sale_items = db.query(SaleItem).all()
     sale_payments = db.query(SalePayment).all()
     sale_returned_items = db.query(SaleReturnedContainer).all()
+
+    sale_packaging_items = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                sale_id,
+                raw_material_id,
+                quantity,
+                unit_cost,
+                subtotal_cost
+            FROM sale_packaging_items
+            ORDER BY id ASC
+            """
+        )
+    ).mappings().all()
+
     products = db.query(Product).all()
     raw_materials = db.query(RawMaterial).all()
 
@@ -3052,7 +3353,39 @@ def get_sales(
             ),
             "quantity": float(item.quantity or 0),
             "price": float(item.price or 0),
-            "subtotal": float(item.subtotal or 0)
+            "subtotal": float(item.subtotal or 0),
+            "cost_total": float(item.cost_total or 0)
+        })
+
+    packaging_by_sale = {}
+
+    for packaging_item in sale_packaging_items:
+
+        material = raw_material_by_id.get(
+            packaging_item["raw_material_id"]
+        )
+
+        packaging_by_sale.setdefault(
+            packaging_item["sale_id"],
+            []
+        ).append({
+            "id": packaging_item["id"],
+            "raw_material_id": packaging_item["raw_material_id"],
+            "name": (
+                material.name
+                if material
+                else
+                "Packaging sin nombre"
+            ),
+            "unit": (
+                material.unit
+                if material
+                else
+                ""
+            ),
+            "quantity": float(packaging_item["quantity"] or 0),
+            "unit_cost": float(packaging_item["unit_cost"] or 0),
+            "subtotal_cost": float(packaging_item["subtotal_cost"] or 0)
         })
 
     payments_by_sale = {}
@@ -3080,6 +3413,32 @@ def get_sales(
             sale
         )
 
+        sale_items_data = items_by_sale.get(
+            sale.id,
+            []
+        )
+
+        sale_packaging_data = packaging_by_sale.get(
+            sale.id,
+            []
+        )
+
+        product_cost = sum(
+            float(item.get("cost_total", 0) or 0)
+            for item in sale_items_data
+        )
+
+        packaging_cost = sum(
+            float(item.get("subtotal_cost", 0) or 0)
+            for item in sale_packaging_data
+        )
+
+        total_real_cost = (
+            product_cost
+            +
+            packaging_cost
+        )
+
         result.append({
             "id": sale.id,
             "number": sale.number,
@@ -3088,13 +3447,20 @@ def get_sales(
             "payment_method": sale.payment_method,
             "shipping_cost": float(sale.shipping_cost or 0),
             "total": float(sale.total or 0),
+            "product_cost": round(product_cost, 2),
+            "packaging_cost": round(packaging_cost, 2),
+            "total_real_cost": round(total_real_cost, 2),
+            "profit": round(
+                float(sale.total or 0)
+                -
+                total_real_cost,
+                2
+            ),
             "amount_paid": float(sale.amount_paid or 0),
             "balance": float(sale.balance or 0),
             "payment_status": sale.payment_status or "PAGADA",
-            "items": items_by_sale.get(
-                sale.id,
-                []
-            ),
+            "items": sale_items_data,
+            "packaging_items": sale_packaging_data,
             "returned_containers": returned_by_sale.get(
                 sale.id,
                 []
