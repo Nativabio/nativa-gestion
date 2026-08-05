@@ -1917,6 +1917,11 @@ def get_products(
 
     products = (
         db.query(Product)
+        .filter(
+            Product.name
+            !=
+            "__PRODUCTO_ELIMINADO_HISTORICO__"
+        )
         .order_by(Product.name.asc())
         .all()
     )
@@ -1978,101 +1983,150 @@ def delete_product(
             "Producto no encontrado"
         }
 
-    formula_count = db.query(Formula).filter(
-        Formula.output_product_id == product.id
-    ).count()
-
-    sale_count = (
-        db.query(SaleItem.sale_id)
-        .filter(
-            SaleItem.product_id == product.id
-        )
-        .distinct()
-        .count()
+    historical_product_name = (
+        "__PRODUCTO_ELIMINADO_HISTORICO__"
     )
 
-    stock_movement_count = (
-        db.query(
-            StockMovementItem.stock_movement_id
-        )
-        .filter(
-            StockMovementItem.product_id == product.id
-        )
-        .distinct()
-        .count()
-    )
-
-    purchase_count = (
-        db.query(PurchaseItem.purchase_id)
-        .filter(
-            PurchaseItem.product_id == product.id
-        )
-        .distinct()
-        .count()
-    )
-
-    blockers = []
-
-    if formula_count:
-
-        blockers.append(
-            f"{formula_count} fórmula(s) asociada(s)"
-        )
-
-    if sale_count:
-
-        blockers.append(
-            f"{sale_count} venta(s) asociada(s)"
-        )
-
-    if stock_movement_count:
-
-        blockers.append(
-            (
-                f"{stock_movement_count} movimiento(s) "
-                "de stock asociado(s)"
-            )
-        )
-
-    if purchase_count:
-
-        blockers.append(
-            f"{purchase_count} compra(s) antigua(s) asociada(s)"
-        )
-
-    if blockers:
+    if product.name == historical_product_name:
 
         return {
             "error":
-            (
-                f"No se puede eliminar {product.name} todavía. "
-                "Eliminá primero: "
-                + "; ".join(blockers)
-                + ". Los asientos contables no se modificarán automáticamente."
-            )
+            "El producto histórico interno no puede eliminarse"
         }
 
     try:
+
+        historical_product = (
+            db.query(Product)
+            .filter(
+                Product.name
+                ==
+                historical_product_name
+            )
+            .first()
+        )
+
+        if not historical_product:
+
+            historical_product = Product(
+                name=historical_product_name,
+                price=0,
+                stock=0
+            )
+
+            db.add(historical_product)
+            db.flush()
+
+        formula_count = db.query(Formula).filter(
+            Formula.output_product_id == product.id
+        ).count()
+
+        sale_item_count = db.query(SaleItem).filter(
+            SaleItem.product_id == product.id
+        ).count()
+
+        stock_movement_item_count = (
+            db.query(StockMovementItem)
+            .filter(
+                StockMovementItem.product_id
+                ==
+                product.id
+            )
+            .count()
+        )
+
+        purchase_item_count = (
+            db.query(PurchaseItem)
+            .filter(
+                PurchaseItem.product_id
+                ==
+                product.id
+            )
+            .count()
+        )
+
+        db.query(Formula).filter(
+            Formula.output_product_id == product.id
+        ).update(
+            {
+                Formula.output_product_id:
+                historical_product.id
+            },
+            synchronize_session=False
+        )
+
+        db.query(SaleItem).filter(
+            SaleItem.product_id == product.id
+        ).update(
+            {
+                SaleItem.product_id:
+                historical_product.id
+            },
+            synchronize_session=False
+        )
+
+        db.query(StockMovementItem).filter(
+            StockMovementItem.product_id == product.id
+        ).update(
+            {
+                StockMovementItem.product_id:
+                historical_product.id
+            },
+            synchronize_session=False
+        )
+
+        db.query(PurchaseItem).filter(
+            PurchaseItem.product_id == product.id
+        ).update(
+            {
+                PurchaseItem.product_id:
+                historical_product.id
+            },
+            synchronize_session=False
+        )
 
         product_name = product.name
 
         db.delete(product)
         db.commit()
 
+        detached_records = (
+            formula_count
+            +
+            sale_item_count
+            +
+            stock_movement_item_count
+            +
+            purchase_item_count
+        )
+
         return {
             "message":
             f"Producto {product_name} eliminado correctamente",
-            "accounting_unchanged": True
+            "detached_records":
+            detached_records,
+            "accounting_unchanged":
+            True,
+            "warning":
+            (
+                f"Se conservaron {detached_records} registro(s) "
+                "histórico(s), reasignados internamente para "
+                "permitir la eliminación. Los asientos contables "
+                "no fueron modificados."
+            )
         }
 
     except Exception as error:
 
         db.rollback()
 
-        return {
-            "error":
-            f"No se pudo eliminar el producto: {error}"
-        }
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error":
+                f"No se pudo eliminar el producto: {error}"
+            }
+        )
 
 
 
