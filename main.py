@@ -157,6 +157,48 @@ with engine.connect() as conn:
 
     conn.execute(
         text(
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS product_type VARCHAR DEFAULT 'MANUFACTURED'"
+        )
+    )
+
+    conn.execute(
+        text(
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS unit_cost FLOAT DEFAULT 0"
+        )
+    )
+
+    conn.execute(
+        text(
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS margin_percent FLOAT DEFAULT 40"
+        )
+    )
+
+    conn.execute(
+        text(
+            "UPDATE products SET product_type = 'MANUFACTURED' WHERE product_type IS NULL"
+        )
+    )
+
+    conn.execute(
+        text(
+            "UPDATE products SET unit_cost = 0 WHERE unit_cost IS NULL"
+        )
+    )
+
+    conn.execute(
+        text(
+            "UPDATE products SET margin_percent = 40 WHERE margin_percent IS NULL"
+        )
+    )
+
+    conn.execute(
+        text(
+            "ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id)"
+        )
+    )
+
+    conn.execute(
+        text(
             "ALTER TABLE formulas ADD COLUMN IF NOT EXISTS margin_percent FLOAT DEFAULT 40"
         )
     )
@@ -562,6 +604,13 @@ def create_default_accounts():
         },
 
         {
+            "code": "1.2.03",
+            "name": "Mercadería para reventa",
+            "type": "ACTIVO",
+            "category": "ACTIVO"
+        },
+
+        {
             "code": "2.1.01",
             "name": "Proveedores",
             "type": "PASIVO",
@@ -599,6 +648,13 @@ def create_default_accounts():
         {
             "code": "5.1.02",
             "name": "Packaging",
+            "type": "COSTO",
+            "category": "COSTO"
+        },
+
+        {
+            "code": "5.1.03",
+            "name": "Costo de mercadería vendida",
             "type": "COSTO",
             "category": "COSTO"
         },
@@ -1910,6 +1966,61 @@ def health():
 
 # ================= PRODUCTOS =================
 
+def normalize_product_type(value):
+
+    normalized = str(
+        value or "MANUFACTURED"
+    ).strip().upper()
+
+    if normalized in {
+        "RESALE",
+        "REVENTA",
+        "PRODUCTO_REVENTA"
+    }:
+
+        return "RESALE"
+
+    return "MANUFACTURED"
+
+
+def is_resale_product(product):
+
+    return normalize_product_type(
+        getattr(
+            product,
+            "product_type",
+            "MANUFACTURED"
+        )
+    ) == "RESALE"
+
+
+def suggested_resale_price(
+    unit_cost,
+    margin_percent
+):
+
+    cost = max(
+        float(unit_cost or 0),
+        0
+    )
+
+    margin = float(
+        margin_percent or 0
+    )
+
+    if margin < 0 or margin >= 100:
+
+        return 0
+
+    denominator = 1 - margin / 100
+
+    if denominator <= 0:
+
+        return 0
+
+    return cost / denominator
+
+
 @app.get("/products")
 def get_products(
     db: Session = Depends(get_db)
@@ -1930,29 +2041,62 @@ def get_products(
 
     for product in products:
 
-        lots = (
-            db.query(Lot)
-            .join(
-                Formula,
-                Lot.formula_id == Formula.id
-            )
-            .filter(
-                Formula.output_product_id == product.id,
-                Lot.remaining_units > 0
-            )
-            .all()
+        product_type = normalize_product_type(
+            product.product_type
         )
 
-        backed_units = sum(
-            float(lot.remaining_units or 0)
-            for lot in lots
-        )
+        if product_type == "RESALE":
 
-        inventory_value = sum(
-            float(lot.remaining_units or 0)
-            *
-            get_inventory_unit_cost(lot)
-            for lot in lots
+            backed_units = float(
+                product.stock or 0
+            )
+
+            unit_cost = max(
+                float(product.unit_cost or 0),
+                0
+            )
+
+            inventory_value = (
+                backed_units
+                *
+                unit_cost
+            )
+
+        else:
+
+            lots = (
+                db.query(Lot)
+                .join(
+                    Formula,
+                    Lot.formula_id == Formula.id
+                )
+                .filter(
+                    Formula.output_product_id == product.id,
+                    Lot.remaining_units > 0
+                )
+                .all()
+            )
+
+            backed_units = sum(
+                float(lot.remaining_units or 0)
+                for lot in lots
+            )
+
+            inventory_value = sum(
+                float(lot.remaining_units or 0)
+                *
+                get_inventory_unit_cost(lot)
+                for lot in lots
+            )
+
+            unit_cost = (
+                inventory_value / backed_units
+                if backed_units > 0
+                else 0
+            )
+
+        margin_percent = float(
+            product.margin_percent or 0
         )
 
         result.append({
@@ -1960,6 +2104,16 @@ def get_products(
             "name": product.name,
             "price": float(product.price or 0),
             "stock": float(product.stock or 0),
+            "product_type": product_type,
+            "unit_cost": round(unit_cost, 6),
+            "margin_percent": margin_percent,
+            "suggested_price": round(
+                suggested_resale_price(
+                    unit_cost,
+                    margin_percent
+                ),
+                2
+            ) if product_type == "RESALE" else 0,
             "inventory_backed_units": round(backed_units, 4),
             "inventory_value": round(inventory_value, 2)
         })
@@ -2011,7 +2165,10 @@ def delete_product(
             historical_product = Product(
                 name=historical_product_name,
                 price=0,
-                stock=0
+                stock=0,
+                product_type="MANUFACTURED",
+                unit_cost=0,
+                margin_percent=40
             )
 
             db.add(historical_product)
@@ -2029,6 +2186,16 @@ def delete_product(
             db.query(StockMovementItem)
             .filter(
                 StockMovementItem.product_id
+                ==
+                product.id
+            )
+            .count()
+        )
+
+        purchase_item_count = (
+            db.query(PurchaseItem)
+            .filter(
+                PurchaseItem.product_id
                 ==
                 product.id
             )
@@ -2065,6 +2232,16 @@ def delete_product(
             synchronize_session=False
         )
 
+        db.query(PurchaseItem).filter(
+            PurchaseItem.product_id == product.id
+        ).update(
+            {
+                PurchaseItem.product_id:
+                historical_product.id
+            },
+            synchronize_session=False
+        )
+
         product_name = product.name
 
         db.delete(product)
@@ -2076,6 +2253,8 @@ def delete_product(
             sale_item_count
             +
             stock_movement_item_count
+            +
+            purchase_item_count
         )
 
         return {
@@ -2114,20 +2293,39 @@ def create_product(
     db: Session = Depends(get_db)
 ):
 
+    product_type = normalize_product_type(
+        product.product_type
+    )
+
+    margin_percent = float(
+        product.margin_percent or 0
+    )
+
+    if margin_percent < 0 or margin_percent >= 100:
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error":
+                "El margen debe ser mayor o igual a 0 y menor a 100"
+            }
+        )
+
     item = Product(
-
-        name=product.name,
-
-        price=product.price,
-
-        stock=product.stock
-
+        name=product.name.strip(),
+        price=max(float(product.price or 0), 0),
+        stock=max(float(product.stock or 0), 0),
+        product_type=product_type,
+        unit_cost=(
+            max(float(product.unit_cost or 0), 0)
+            if product_type == "RESALE"
+            else 0
+        ),
+        margin_percent=margin_percent
     )
 
     db.add(item)
-
     db.commit()
-
     db.refresh(item)
 
     return item
@@ -2147,13 +2345,39 @@ def update_product(
 
         return {"error": "Producto no encontrado"}
 
-    product.price = data["price"]
+    if "price" in data:
+
+        product.price = max(
+            float(data.get("price", 0) or 0),
+            0
+        )
+
+    if "margin_percent" in data:
+
+        margin_percent = float(
+            data.get("margin_percent", 0)
+            or
+            0
+        )
+
+        if margin_percent < 0 or margin_percent >= 100:
+
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error":
+                    "El margen debe ser mayor o igual a 0 y menor a 100"
+                }
+            )
+
+        product.margin_percent = margin_percent
 
     db.commit()
-
     db.refresh(product)
 
-    return product    
+    return product
+
+# ================= VENTAS =================
 
 # ================= VENTAS =================
 
@@ -2834,7 +3058,6 @@ def apply_sale_items(
     packaging_items=None
 ):
 
-
     shipping_cost_value = float(
         shipping_cost or 0
     )
@@ -2933,6 +3156,10 @@ def apply_sale_items(
                 f"Stock insuficiente de {product.name}"
             )
 
+        if is_resale_product(product):
+
+            continue
+
         fifo_lots = (
             db.query(Lot)
             .join(
@@ -2972,7 +3199,8 @@ def apply_sale_items(
             )
 
     sale.total = 0
-    total_cost_of_sale = 0
+    manufactured_cost = 0
+    resale_cost = 0
     zero_cost_lots = []
 
     for item in clean_items:
@@ -2997,96 +3225,117 @@ def apply_sale_items(
         db.add(sale_item)
         db.flush()
 
-        quantity_to_allocate = quantity
-        item_cost = 0
+        if is_resale_product(product):
 
-        fifo_lots = (
-            db.query(Lot)
-            .join(
-                Formula,
-                Lot.formula_id == Formula.id
-            )
-            .filter(
-                Formula.output_product_id == product.id,
-                Lot.remaining_units > 0
-            )
-            .order_by(
-                Lot.production_date.asc(),
-                Lot.id.asc()
-            )
-            .with_for_update()
-            .all()
-        )
-
-        for lot in fifo_lots:
-
-            available = float(
-                lot.remaining_units or 0
+            unit_cost = max(
+                float(product.unit_cost or 0),
+                0
             )
 
-            quantity_used = min(
-                available,
-                quantity_to_allocate
-            )
-
-            if quantity_used <= 0:
-
-                continue
-
-            unit_cost = get_inventory_unit_cost(
-                lot
-            )
-
-            subtotal_cost = (
-                quantity_used
-                *
-                unit_cost
-            )
-
-            db.add(
-                SaleLotAllocation(
-                    sale_item_id=sale_item.id,
-                    lot_id=lot.id,
-                    quantity=quantity_used,
-                    unit_cost=unit_cost,
-                    subtotal_cost=subtotal_cost
-                )
-            )
-
-            lot.remaining_units = (
-                available
-                -
-                quantity_used
-            )
-
-            if lot.remaining_units <= 0.000001:
-
-                lot.remaining_units = 0
-                lot.status = "Agotado"
-
-            else:
-
-                lot.status = "Disponible"
+            item_cost = quantity * unit_cost
 
             if unit_cost <= 0:
 
                 zero_cost_lots.append(
-                    str(lot.lot_number)
+                    f"Reventa: {product.name}"
                 )
 
-            item_cost += subtotal_cost
-            quantity_to_allocate -= quantity_used
+            resale_cost += item_cost
 
-            if quantity_to_allocate <= 0.000001:
+        else:
 
-                break
+            quantity_to_allocate = quantity
+            item_cost = 0
 
-        if quantity_to_allocate > 0.000001:
-
-            raise ValueError(
-                f"No fue posible asignar todos los lotes "
-                f"de {product.name}"
+            fifo_lots = (
+                db.query(Lot)
+                .join(
+                    Formula,
+                    Lot.formula_id == Formula.id
+                )
+                .filter(
+                    Formula.output_product_id == product.id,
+                    Lot.remaining_units > 0
+                )
+                .order_by(
+                    Lot.production_date.asc(),
+                    Lot.id.asc()
+                )
+                .with_for_update()
+                .all()
             )
+
+            for lot in fifo_lots:
+
+                available = float(
+                    lot.remaining_units or 0
+                )
+
+                quantity_used = min(
+                    available,
+                    quantity_to_allocate
+                )
+
+                if quantity_used <= 0:
+
+                    continue
+
+                unit_cost = get_inventory_unit_cost(
+                    lot
+                )
+
+                subtotal_cost = (
+                    quantity_used
+                    *
+                    unit_cost
+                )
+
+                db.add(
+                    SaleLotAllocation(
+                        sale_item_id=sale_item.id,
+                        lot_id=lot.id,
+                        quantity=quantity_used,
+                        unit_cost=unit_cost,
+                        subtotal_cost=subtotal_cost
+                    )
+                )
+
+                lot.remaining_units = (
+                    available
+                    -
+                    quantity_used
+                )
+
+                if lot.remaining_units <= 0.000001:
+
+                    lot.remaining_units = 0
+                    lot.status = "Agotado"
+
+                else:
+
+                    lot.status = "Disponible"
+
+                if unit_cost <= 0:
+
+                    zero_cost_lots.append(
+                        str(lot.lot_number)
+                    )
+
+                item_cost += subtotal_cost
+                quantity_to_allocate -= quantity_used
+
+                if quantity_to_allocate <= 0.000001:
+
+                    break
+
+            if quantity_to_allocate > 0.000001:
+
+                raise ValueError(
+                    f"No fue posible asignar todos los lotes "
+                    f"de {product.name}"
+                )
+
+            manufactured_cost += item_cost
 
         sale_item.cost_total = item_cost
 
@@ -3097,7 +3346,12 @@ def apply_sale_items(
         )
 
         sale.total += subtotal
-        total_cost_of_sale += item_cost
+
+    total_cost_of_sale = (
+        manufactured_cost
+        +
+        resale_cost
+    )
 
     sale.shipping_cost = shipping_cost_value
     sale.total += shipping_cost_value
@@ -3135,7 +3389,7 @@ def apply_sale_items(
             origin_id=sale.id
         )
 
-    if total_cost_of_sale > 0:
+    if manufactured_cost > 0:
 
         registrar_asiento(
             db=db,
@@ -3145,7 +3399,22 @@ def apply_sale_items(
             debe_nombre="Costo de Ventas",
             haber_codigo="1.2.02",
             haber_nombre="Productos Terminados",
-            importe=total_cost_of_sale,
+            importe=manufactured_cost,
+            origin="CMV",
+            origin_id=sale.id
+        )
+
+    if resale_cost > 0:
+
+        registrar_asiento(
+            db=db,
+            fecha=sale.date,
+            concepto=f"Costo de venta {sale.number}",
+            debe_codigo="5.1.03",
+            debe_nombre="Costo de mercadería vendida",
+            haber_codigo="1.2.03",
+            haber_nombre="Mercadería para reventa",
+            importe=resale_cost,
             origin="CMV",
             origin_id=sale.id
         )
@@ -4027,6 +4296,17 @@ def latest_product_inventory_cost(
     product_id
 ):
 
+    product = db.query(Product).filter(
+        Product.id == product_id
+    ).first()
+
+    if product and is_resale_product(product):
+
+        return max(
+            float(product.unit_cost or 0),
+            0
+        )
+
     lots = (
         db.query(Lot)
         .join(
@@ -4124,43 +4404,18 @@ def create_stock_movement(
     db: Session = Depends(get_db)
 ):
 
-    date = str(
-        data.get(
-            "date",
-            ""
-        )
-    ).strip()
-
-    reason = str(
-        data.get(
-            "reason",
-            ""
-        )
-    ).strip().upper()
-
+    date = str(data.get("date", "")).strip()
+    reason = str(data.get("reason", "")).strip().upper()
     movement_type = str(
         data.get(
             "movement_type",
-            data.get(
-                "type",
-                "OUT"
-            )
+            data.get("type", "OUT")
         )
         or
         "OUT"
     ).strip().upper()
-
-    notes = str(
-        data.get(
-            "notes",
-            ""
-        )
-    ).strip()
-
-    items_data = data.get(
-        "items",
-        []
-    )
+    notes = str(data.get("notes", "")).strip()
+    items_data = data.get("items", [])
 
     if movement_type in {
         "ALTA",
@@ -4177,42 +4432,24 @@ def create_stock_movement(
 
     if not date:
 
-        return {
-            "error":
-            "La fecha es obligatoria"
-        }
+        return {"error": "La fecha es obligatoria"}
 
-    reason_data = STOCK_MOVEMENT_REASONS.get(
-        reason
-    )
+    reason_data = STOCK_MOVEMENT_REASONS.get(reason)
 
     if not reason_data:
 
-        return {
-            "error":
-            "El motivo del ajuste no es válido"
-        }
+        return {"error": "El motivo del ajuste no es válido"}
 
-    if (
-        movement_type == "IN"
-        and
-        reason != "STOCK_CONTROL"
-    ):
+    if movement_type == "IN" and reason != "STOCK_CONTROL":
 
         return {
             "error":
             "Las altas solo pueden registrarse por control de stock"
         }
 
-    if not isinstance(
-        items_data,
-        list
-    ) or not items_data:
+    if not isinstance(items_data, list) or not items_data:
 
-        return {
-            "error":
-            "Agregá al menos un producto"
-        }
+        return {"error": "Agregá al menos un producto"}
 
     quantities_by_product = {}
 
@@ -4220,25 +4457,10 @@ def create_stock_movement(
 
         try:
 
-            product_id = int(
-                item.get(
-                    "product_id"
-                )
-            )
+            product_id = int(item.get("product_id"))
+            quantity = float(item.get("quantity", 0) or 0)
 
-            quantity = float(
-                item.get(
-                    "quantity",
-                    0
-                )
-                or
-                0
-            )
-
-        except (
-            TypeError,
-            ValueError
-        ):
+        except (TypeError, ValueError):
 
             return {
                 "error":
@@ -4253,10 +4475,7 @@ def create_stock_movement(
             }
 
         quantities_by_product[product_id] = (
-            quantities_by_product.get(
-                product_id,
-                0
-            )
+            quantities_by_product.get(product_id, 0)
             +
             quantity
         )
@@ -4269,9 +4488,7 @@ def create_stock_movement(
 
         product = (
             db.query(Product)
-            .filter(
-                Product.id == product_id
-            )
+            .filter(Product.id == product_id)
             .with_for_update()
             .first()
         )
@@ -4287,9 +4504,10 @@ def create_stock_movement(
 
         if movement_type == "IN":
 
-            if not latest_formula_for_product(
-                db,
-                product_id
+            if (
+                not is_resale_product(product)
+                and
+                not latest_formula_for_product(db, product_id)
             ):
 
                 return {
@@ -4315,12 +4533,13 @@ def create_stock_movement(
                 f"Stock insuficiente de {product.name}"
             }
 
+        if is_resale_product(product):
+
+            continue
+
         fifo_lots = (
             db.query(Lot)
-            .join(
-                Formula,
-                Lot.formula_id == Formula.id
-            )
+            .join(Formula, Lot.formula_id == Formula.id)
             .filter(
                 Formula.output_product_id == product_id,
                 Lot.remaining_units > 0
@@ -4337,13 +4556,7 @@ def create_stock_movement(
             for lot in fifo_lots
         )
 
-        if (
-            lot_stock
-            +
-            0.000001
-            <
-            required_quantity
-        ):
+        if lot_stock + 0.000001 < required_quantity:
 
             return {
                 "error":
@@ -4368,25 +4581,18 @@ def create_stock_movement(
         db.add(movement)
         db.flush()
 
-        prefix = (
-            "AS"
-            if movement_type == "IN"
-            else
-            "BS"
-        )
-
+        prefix = "AS" if movement_type == "IN" else "BS"
         movement.number = f"{prefix}{movement.id:04d}"
 
-        total_cost = 0
+        manufactured_cost = 0
+        resale_cost = 0
         zero_cost_lots = []
 
         for product_id, quantity in (
             quantities_by_product.items()
         ):
 
-            product = products_by_id[
-                product_id
-            ]
+            product = products_by_id[product_id]
 
             movement_item = StockMovementItem(
                 stock_movement_id=movement.id,
@@ -4397,6 +4603,41 @@ def create_stock_movement(
 
             db.add(movement_item)
             db.flush()
+
+            if is_resale_product(product):
+
+                unit_cost = max(
+                    float(product.unit_cost or 0),
+                    0
+                )
+                item_cost = quantity * unit_cost
+                movement_item.cost_total = item_cost
+
+                if movement_type == "IN":
+
+                    product.stock = (
+                        float(product.stock or 0)
+                        +
+                        quantity
+                    )
+
+                else:
+
+                    product.stock = (
+                        float(product.stock or 0)
+                        -
+                        quantity
+                    )
+
+                resale_cost += item_cost
+
+                if unit_cost <= 0:
+
+                    zero_cost_lots.append(
+                        f"Reventa: {product.name}"
+                    )
+
+                continue
 
             if movement_type == "IN":
 
@@ -4424,14 +4665,12 @@ def create_stock_movement(
                 )
 
                 movement_item.cost_total = item_cost
-
                 product.stock = (
                     float(product.stock or 0)
                     +
                     quantity
                 )
-
-                total_cost += item_cost
+                manufactured_cost += item_cost
 
                 if item_cost <= 0:
 
@@ -4446,10 +4685,7 @@ def create_stock_movement(
 
             fifo_lots = (
                 db.query(Lot)
-                .join(
-                    Formula,
-                    Lot.formula_id == Formula.id
-                )
+                .join(Formula, Lot.formula_id == Formula.id)
                 .filter(
                     Formula.output_product_id == product.id,
                     Lot.remaining_units > 0
@@ -4464,10 +4700,7 @@ def create_stock_movement(
 
             for lot in fifo_lots:
 
-                available = float(
-                    lot.remaining_units or 0
-                )
-
+                available = float(lot.remaining_units or 0)
                 quantity_used = min(
                     available,
                     quantity_to_allocate
@@ -4477,15 +4710,8 @@ def create_stock_movement(
 
                     continue
 
-                unit_cost = get_inventory_unit_cost(
-                    lot
-                )
-
-                subtotal_cost = (
-                    quantity_used
-                    *
-                    unit_cost
-                )
+                unit_cost = get_inventory_unit_cost(lot)
+                subtotal_cost = quantity_used * unit_cost
 
                 db.add(
                     StockMovementLotAllocation(
@@ -4497,11 +4723,7 @@ def create_stock_movement(
                     )
                 )
 
-                lot.remaining_units = (
-                    available
-                    -
-                    quantity_used
-                )
+                lot.remaining_units = available - quantity_used
 
                 if lot.remaining_units <= 0.000001:
 
@@ -4514,9 +4736,7 @@ def create_stock_movement(
 
                 if unit_cost <= 0:
 
-                    zero_cost_lots.append(
-                        str(lot.lot_number)
-                    )
+                    zero_cost_lots.append(str(lot.lot_number))
 
                 item_cost += subtotal_cost
                 quantity_to_allocate -= quantity_used
@@ -4532,34 +4752,42 @@ def create_stock_movement(
                 )
 
             movement_item.cost_total = item_cost
-
             product.stock = (
                 float(product.stock or 0)
                 -
                 quantity
             )
+            manufactured_cost += item_cost
 
-            total_cost += item_cost
-
+        total_cost = manufactured_cost + resale_cost
         movement.total_cost = total_cost
 
-        if total_cost > 0:
+        action_concept = (
+            f"Alta de stock {movement.number} - "
+            if movement_type == "IN"
+            else f"Baja de stock {movement.number} - "
+        ) + reason_data["label"]
+
+        origin = (
+            "ALTA_STOCK"
+            if movement_type == "IN"
+            else "BAJA_STOCK"
+        )
+
+        if manufactured_cost > 0:
 
             if movement_type == "IN":
 
                 registrar_asiento(
                     db=db,
                     fecha=date,
-                    concepto=(
-                        f"Alta de stock {movement.number} - "
-                        f"{reason_data['label']}"
-                    ),
+                    concepto=action_concept,
                     debe_codigo="1.2.02",
                     debe_nombre="Productos Terminados",
                     haber_codigo=reason_data["account_code"],
                     haber_nombre=reason_data["account_name"],
-                    importe=total_cost,
-                    origin="ALTA_STOCK",
+                    importe=manufactured_cost,
+                    origin=origin,
                     origin_id=movement.id
                 )
 
@@ -4568,28 +4796,52 @@ def create_stock_movement(
                 registrar_asiento(
                     db=db,
                     fecha=date,
-                    concepto=(
-                        f"Baja de stock {movement.number} - "
-                        f"{reason_data['label']}"
-                    ),
+                    concepto=action_concept,
                     debe_codigo=reason_data["account_code"],
                     debe_nombre=reason_data["account_name"],
                     haber_codigo="1.2.02",
                     haber_nombre="Productos Terminados",
-                    importe=total_cost,
-                    origin="BAJA_STOCK",
+                    importe=manufactured_cost,
+                    origin=origin,
+                    origin_id=movement.id
+                )
+
+        if resale_cost > 0:
+
+            if movement_type == "IN":
+
+                registrar_asiento(
+                    db=db,
+                    fecha=date,
+                    concepto=action_concept,
+                    debe_codigo="1.2.03",
+                    debe_nombre="Mercadería para reventa",
+                    haber_codigo=reason_data["account_code"],
+                    haber_nombre=reason_data["account_name"],
+                    importe=resale_cost,
+                    origin=origin,
+                    origin_id=movement.id
+                )
+
+            else:
+
+                registrar_asiento(
+                    db=db,
+                    fecha=date,
+                    concepto=action_concept,
+                    debe_codigo=reason_data["account_code"],
+                    debe_nombre=reason_data["account_name"],
+                    haber_codigo="1.2.03",
+                    haber_nombre="Mercadería para reventa",
+                    importe=resale_cost,
+                    origin=origin,
                     origin_id=movement.id
                 )
 
         db.commit()
         db.refresh(movement)
 
-        action_label = (
-            "Alta"
-            if movement_type == "IN"
-            else
-            "Baja"
-        )
+        action_label = "Alta" if movement_type == "IN" else "Baja"
 
         response = {
             "id": movement.id,
@@ -4602,13 +4854,9 @@ def create_stock_movement(
         if zero_cost_lots:
 
             response["advertencia"] = (
-                "Hay lotes con costo unitario cero: "
+                "Hay artículos con costo unitario cero: "
                 +
-                ", ".join(
-                    sorted(
-                        set(zero_cost_lots)
-                    )
-                )
+                ", ".join(sorted(set(zero_cost_lots)))
             )
 
         return response
@@ -4616,13 +4864,7 @@ def create_stock_movement(
     except Exception as error:
 
         db.rollback()
-
-        action_label = (
-            "alta"
-            if movement_type == "IN"
-            else
-            "baja"
-        )
+        action_label = "alta" if movement_type == "IN" else "baja"
 
         return {
             "error":
@@ -4725,11 +4967,7 @@ def delete_stock_movement(
             "Ajuste de stock no encontrado"
         }
 
-    movement_type = (
-        movement.movement_type
-        or
-        "OUT"
-    )
+    movement_type = movement.movement_type or "OUT"
 
     try:
 
@@ -4751,6 +4989,24 @@ def delete_stock_movement(
                     Product.id == item.product_id
                 ).first()
 
+                if not product:
+
+                    raise ValueError(
+                        "No se encontró uno de los productos del ajuste"
+                    )
+
+                if (
+                    float(product.stock or 0)
+                    +
+                    0.000001
+                    <
+                    float(item.quantity or 0)
+                ):
+
+                    raise ValueError(
+                        f"No se puede revertir el alta porque el stock actual de {product.name} es menor."
+                    )
+
                 allocations = (
                     db.query(StockMovementLotAllocation)
                     .filter(
@@ -4759,17 +5015,10 @@ def delete_stock_movement(
                     .all()
                 )
 
-                if not product:
+                if is_resale_product(product):
 
-                    raise ValueError(
-                        "No se encontró uno de los productos del ajuste"
-                    )
-
-                if float(product.stock or 0) + 0.000001 < float(item.quantity or 0):
-
-                    raise ValueError(
-                        f"No se puede revertir el alta porque el stock actual de {product.name} es menor."
-                    )
+                    validations.append((item, product, None, None))
+                    continue
 
                 for allocation in allocations:
 
@@ -4805,24 +5054,29 @@ def delete_stock_movement(
                         )
 
                     validations.append(
-                        (
-                            item,
-                            product,
-                            allocation,
-                            lot
-                        )
+                        (item, product, allocation, lot)
                     )
+
+            processed_items = set()
 
             for item, product, allocation, lot in validations:
 
-                product.stock = (
-                    float(product.stock or 0)
-                    -
-                    float(allocation.quantity or 0)
-                )
+                if item.id not in processed_items:
 
-                db.delete(allocation)
-                db.delete(lot)
+                    product.stock = (
+                        float(product.stock or 0)
+                        -
+                        float(item.quantity or 0)
+                    )
+                    processed_items.add(item.id)
+
+                if allocation:
+
+                    db.delete(allocation)
+
+                if lot:
+
+                    db.delete(lot)
 
             for item in movement_items:
 
@@ -4856,7 +5110,6 @@ def delete_stock_movement(
                             +
                             float(allocation.quantity or 0)
                         )
-
                         lot.status = "Disponible"
 
                     db.delete(allocation)
@@ -4881,18 +5134,14 @@ def delete_stock_movement(
         db.query(JournalEntry).filter(
             JournalEntry.origin == origin,
             JournalEntry.origin_id == movement.id
-        ).delete(
-            synchronize_session=False
-        )
+        ).delete(synchronize_session=False)
 
         db.query(JournalEntry).filter(
             JournalEntry.origin_id.is_(None),
             JournalEntry.concept.like(
                 f"{action_label} de stock {movement.number}%"
             )
-        ).delete(
-            synchronize_session=False
-        )
+        ).delete(synchronize_session=False)
 
         db.delete(movement)
         db.commit()
@@ -4914,6 +5163,8 @@ def delete_stock_movement(
 
 # ================= COMPRAS =================
 
+# ================= COMPRAS =================
+
 @app.get("/purchases")
 def get_purchases(
     db: Session = Depends(get_db)
@@ -4928,97 +5179,82 @@ def get_purchases(
         .all()
     )
 
-    purchase_items = (
-        db.query(PurchaseItem).all()
-    )
-
-    raw_materials = (
-        db.query(RawMaterial).all()
-    )
-
+    purchase_items = db.query(PurchaseItem).all()
+    raw_materials = db.query(RawMaterial).all()
+    products = db.query(Product).all()
     suppliers = db.query(Supplier).all()
 
     material_by_id = {
-
-        material.id:
-        material
-
+        material.id: material
         for material in raw_materials
+    }
 
+    product_by_id = {
+        product.id: product
+        for product in products
     }
 
     supplier_name_by_id = {
-
-        str(supplier.id):
-        supplier.name
-
+        str(supplier.id): supplier.name
         for supplier in suppliers
-
     }
 
     supplier_name_by_name = {
-
-        str(supplier.name).strip().lower():
-        supplier.name
-
+        str(supplier.name).strip().lower(): supplier.name
         for supplier in suppliers
-
         if supplier.name
-
     }
 
     items_by_purchase = {}
 
     for item in purchase_items:
 
-        material = material_by_id.get(
-            item.raw_material_id
-        )
+        if item.product_id:
+
+            product = product_by_id.get(item.product_id)
+
+            item_data = {
+                "id": item.id,
+                "item_type": "RESALE",
+                "raw_material_id": None,
+                "product_id": item.product_id,
+                "name": (
+                    product.name
+                    if product
+                    else "Producto de reventa sin nombre"
+                ),
+                "unit": "unidad",
+                "quantity": float(item.quantity or 0),
+                "price": float(item.price or 0)
+            }
+
+        else:
+
+            material = material_by_id.get(
+                item.raw_material_id
+            )
+
+            item_data = {
+                "id": item.id,
+                "item_type": "RAW_MATERIAL",
+                "raw_material_id": item.raw_material_id,
+                "product_id": None,
+                "name": (
+                    material.name
+                    if material
+                    else "Materia prima sin nombre"
+                ),
+                "unit": material.unit if material else "",
+                "quantity": float(item.quantity or 0),
+                "price": float(item.price or 0)
+            }
 
         items_by_purchase.setdefault(
             item.purchase_id,
             []
-        ).append({
-
-            "id":
-            item.id,
-
-            "raw_material_id":
-            item.raw_material_id,
-
-            "name":
-            (
-                material.name
-                if material
-                else
-                "Materia prima sin nombre"
-            ),
-
-            "unit":
-            (
-                material.unit
-                if material
-                else
-                ""
-            ),
-
-            "quantity":
-            float(
-                item.quantity or 0
-            ),
-
-            "price":
-            float(
-                item.price or 0
-            )
-
-        })
+        ).append(item_data)
 
     result = []
-
-    metadata_prefix = (
-        "__NATIVA_PURCHASE_META__"
-    )
 
     for purchase in purchases:
 
@@ -5026,53 +5262,33 @@ def get_purchases(
             purchase.supplier or ""
         ).strip()
 
-        supplier_name = (
-            supplier_name_by_id.get(
-                supplier_value
-            )
+        supplier_name = supplier_name_by_id.get(
+            supplier_value
         )
 
         if not supplier_name:
 
-            supplier_name = (
-                supplier_name_by_name.get(
-                    supplier_value.lower()
-                )
+            supplier_name = supplier_name_by_name.get(
+                supplier_value.lower()
             )
 
         if not supplier_name:
 
-            supplier_name = (
-                supplier_value
-                or
-                "Sin proveedor"
-            )
+            supplier_name = supplier_value or "Sin proveedor"
 
-        raw_notes = str(
-            purchase.notes or ""
-        )
-
+        raw_notes = str(purchase.notes or "")
         metadata = {}
-
         visible_notes = raw_notes
 
-        if raw_notes.startswith(
-            metadata_prefix
-        ):
+        if raw_notes.startswith(PURCHASE_METADATA_PREFIX):
 
             try:
 
                 metadata = json.loads(
-                    raw_notes[
-                        len(metadata_prefix):
-                    ]
+                    raw_notes[len(PURCHASE_METADATA_PREFIX):]
                 )
-
                 visible_notes = str(
-                    metadata.get(
-                        "notes",
-                        ""
-                    )
+                    metadata.get("notes", "")
                 )
 
             except Exception:
@@ -5080,68 +5296,27 @@ def get_purchases(
                 metadata = {}
                 visible_notes = raw_notes
 
-        extra_items = metadata.get(
-            "extra_items",
-            []
-        )
+        extra_items = metadata.get("extra_items", [])
 
-        if not isinstance(
-            extra_items,
-            list
-        ):
+        if not isinstance(extra_items, list):
 
             extra_items = []
 
         result.append({
-
-            "id":
-            purchase.id,
-
-            "number":
-            purchase.number,
-
-            "supplier":
-            supplier_name,
-
-            "supplier_reference":
-            supplier_value,
-
-            "invoice_number":
-            purchase.invoice_number,
-
-            "payment_method":
-            purchase.payment_method,
-
-            "date":
-            purchase.date,
-
-            "notes":
-            visible_notes,
-
-            "shipping_cost":
-            float(
-                metadata.get(
-                    "shipping_cost",
-                    0
-                )
-                or
-                0
+            "id": purchase.id,
+            "number": purchase.number,
+            "supplier": supplier_name,
+            "supplier_reference": supplier_value,
+            "invoice_number": purchase.invoice_number,
+            "payment_method": purchase.payment_method,
+            "date": purchase.date,
+            "notes": visible_notes,
+            "shipping_cost": float(
+                metadata.get("shipping_cost", 0) or 0
             ),
-
-            "extra_items":
-            extra_items,
-
-            "total":
-            float(
-                purchase.total or 0
-            ),
-
-            "items":
-            items_by_purchase.get(
-                purchase.id,
-                []
-            )
-
+            "extra_items": extra_items,
+            "total": float(purchase.total or 0),
+            "items": items_by_purchase.get(purchase.id, [])
         })
 
     return result
@@ -5239,25 +5414,10 @@ def clean_purchase_payload(
     data
 ):
 
-    items = data.get(
-        "items",
-        []
-    )
-
-    extra_items = data.get(
-        "extra_items",
-        []
-    )
-
+    items = data.get("items", [])
+    extra_items = data.get("extra_items", [])
     shipping_cost = max(
-        float(
-            data.get(
-                "shipping_cost",
-                0
-            )
-            or
-            0
-        ),
+        float(data.get("shipping_cost", 0) or 0),
         0
     )
 
@@ -5265,27 +5425,31 @@ def clean_purchase_payload(
 
     for item in items:
 
-        raw_material_id = int(
-            item.get("raw_material_id")
-        )
-
-        quantity = float(
-            item.get(
-                "quantity",
-                0
-            )
+        item_type = str(
+            item.get("item_type", "")
             or
-            0
-        )
+            ""
+        ).strip().upper()
 
-        price = float(
-            item.get(
-                "price",
-                0
-            )
+        product_id_value = item.get("product_id")
+        raw_material_id_value = item.get("raw_material_id")
+
+        if (
+            item_type in {"RESALE", "REVENTA"}
             or
-            0
-        )
+            product_id_value not in {None, ""}
+        ):
+
+            item_type = "RESALE"
+            inventory_id = int(product_id_value)
+
+        else:
+
+            item_type = "RAW_MATERIAL"
+            inventory_id = int(raw_material_id_value)
+
+        quantity = float(item.get("quantity", 0) or 0)
+        price = float(item.get("price", 0) or 0)
 
         if quantity <= 0:
 
@@ -5300,53 +5464,34 @@ def clean_purchase_payload(
             )
 
         clean_items.append({
-            "raw_material_id":
-            raw_material_id,
-            "quantity":
-            quantity,
-            "price":
-            price
+            "item_type": item_type,
+            "inventory_id": inventory_id,
+            "raw_material_id": (
+                inventory_id
+                if item_type == "RAW_MATERIAL"
+                else None
+            ),
+            "product_id": (
+                inventory_id
+                if item_type == "RESALE"
+                else None
+            ),
+            "quantity": quantity,
+            "price": price
         })
 
     clean_extra_items = []
 
     for item in extra_items:
 
-        name = str(
-            item.get(
-                "name",
-                ""
-            )
-            or
-            ""
-        ).strip()
-
+        name = str(item.get("name", "") or "").strip()
         category = str(
-            item.get(
-                "category",
-                "Otro"
-            )
+            item.get("category", "Otro")
             or
             "Otro"
         ).strip()
-
-        quantity = float(
-            item.get(
-                "quantity",
-                0
-            )
-            or
-            0
-        )
-
-        price = float(
-            item.get(
-                "price",
-                0
-            )
-            or
-            0
-        )
+        quantity = float(item.get("quantity", 0) or 0)
+        price = float(item.get("price", 0) or 0)
 
         if not name:
 
@@ -5377,14 +5522,10 @@ def clean_purchase_payload(
             "La compra no tiene importes válidos"
         )
 
-    return (
-        clean_items,
-        clean_extra_items,
-        shipping_cost
-    )
+    return (clean_items, clean_extra_items, shipping_cost)
 
 
-def purchase_quantities_by_material(
+def purchase_quantities_by_inventory(
     db,
     purchase_id
 ):
@@ -5395,11 +5536,19 @@ def purchase_quantities_by_material(
         PurchaseItem.purchase_id == purchase_id
     ).all():
 
-        result[item.raw_material_id] = (
-            result.get(
-                item.raw_material_id,
-                0
+        if item.product_id:
+
+            key = ("RESALE", int(item.product_id))
+
+        else:
+
+            key = (
+                "RAW_MATERIAL",
+                int(item.raw_material_id)
             )
+
+        result[key] = (
+            result.get(key, 0)
             +
             float(item.quantity or 0)
         )
@@ -5417,67 +5566,67 @@ def remove_purchase_contents(
         PurchaseItem.purchase_id == purchase.id
     ).all()
 
-    quantities = {}
+    quantities = purchase_quantities_by_inventory(
+        db,
+        purchase.id
+    )
 
-    for item in purchase_items:
-
-        quantities[item.raw_material_id] = (
-            quantities.get(
-                item.raw_material_id,
-                0
-            )
-            +
-            float(item.quantity or 0)
-        )
-
-    materials_by_id = {}
+    inventory_by_key = {}
 
     if adjust_stock:
 
-        for material_id, quantity in quantities.items():
+        for key, quantity in quantities.items():
 
-            material = (
-                db.query(RawMaterial)
-                .filter(
-                    RawMaterial.id == material_id
+            item_type, inventory_id = key
+
+            if item_type == "RESALE":
+
+                inventory = (
+                    db.query(Product)
+                    .filter(Product.id == inventory_id)
+                    .with_for_update()
+                    .first()
                 )
-                .with_for_update()
-                .first()
-            )
 
-            if not material:
+                if inventory and not is_resale_product(inventory):
+
+                    raise ValueError(
+                        f"{inventory.name} ya no está marcado como producto de reventa"
+                    )
+
+            else:
+
+                inventory = (
+                    db.query(RawMaterial)
+                    .filter(RawMaterial.id == inventory_id)
+                    .with_for_update()
+                    .first()
+                )
+
+            if not inventory:
 
                 continue
 
-            if (
-                float(material.stock or 0)
-                +
-                0.000001
-                <
-                quantity
-            ):
+            if float(inventory.stock or 0) + 0.000001 < quantity:
 
                 raise ValueError(
                     (
-                        f"No se puede revertir la compra porque "
-                        f"ya se consumió parte del stock de "
-                        f"{material.name}. Stock actual: "
-                        f"{float(material.stock or 0)}"
+                        "No se puede revertir la compra porque "
+                        f"ya se consumió parte del stock de {inventory.name}. "
+                        f"Stock actual: {float(inventory.stock or 0)}"
                     )
                 )
 
-            materials_by_id[material_id] = material
+            inventory_by_key[key] = inventory
 
-        for material_id, quantity in quantities.items():
+        for key, quantity in quantities.items():
 
-            material = materials_by_id.get(
-                material_id
-            )
+            inventory = inventory_by_key.get(key)
 
-            if material:
+            if inventory:
 
-                material.stock = (
-                    float(material.stock or 0)
+                inventory.stock = (
+                    float(inventory.stock or 0)
                     -
                     quantity
                 )
@@ -5489,24 +5638,28 @@ def remove_purchase_contents(
     db.query(JournalEntry).filter(
         JournalEntry.origin == "COMPRA",
         JournalEntry.origin_id == purchase.id
-    ).delete(
-        synchronize_session=False
-    )
+    ).delete(synchronize_session=False)
 
     db.query(JournalEntry).filter(
         JournalEntry.origin_id.is_(None),
-        JournalEntry.concept == (
-            f"Compra {purchase.number}"
-        )
-    ).delete(
-        synchronize_session=False
-    )
+        JournalEntry.concept == f"Compra {purchase.number}"
+    ).delete(synchronize_session=False)
 
     purchase.total = 0
-
     db.flush()
 
-    return set(quantities.keys())
+    material_ids = {
+        inventory_id
+        for item_type, inventory_id in quantities
+        if item_type == "RAW_MATERIAL"
+    }
+    product_ids = {
+        inventory_id
+        for item_type, inventory_id in quantities
+        if item_type == "RESALE"
+    }
+
+    return material_ids, product_ids
 
 
 def recalculate_raw_material_costs(
@@ -5531,7 +5684,8 @@ def recalculate_raw_material_costs(
                 PurchaseItem.purchase_id == Purchase.id
             )
             .filter(
-                PurchaseItem.raw_material_id == material_id
+                PurchaseItem.raw_material_id == material_id,
+                PurchaseItem.product_id.is_(None)
             )
             .order_by(
                 Purchase.date.desc(),
@@ -5540,11 +5694,7 @@ def recalculate_raw_material_costs(
             .first()
         )
 
-        if (
-            latest_item
-            and
-            float(latest_item.quantity or 0) > 0
-        ):
+        if latest_item and float(latest_item.quantity or 0) > 0:
 
             material.cost = (
                 float(latest_item.price or 0)
@@ -5555,6 +5705,50 @@ def recalculate_raw_material_costs(
         else:
 
             material.cost = 0
+
+
+def recalculate_resale_product_costs(
+    db,
+    product_ids
+):
+
+    for product_id in set(product_ids):
+
+        product = db.query(Product).filter(
+            Product.id == product_id
+        ).first()
+
+        if not product:
+
+            continue
+
+        latest_item = (
+            db.query(PurchaseItem)
+            .join(
+                Purchase,
+                PurchaseItem.purchase_id == Purchase.id
+            )
+            .filter(
+                PurchaseItem.product_id == product_id
+            )
+            .order_by(
+                Purchase.date.desc(),
+                PurchaseItem.id.desc()
+            )
+            .first()
+        )
+
+        if latest_item and float(latest_item.quantity or 0) > 0:
+
+            product.unit_cost = (
+                float(latest_item.price or 0)
+                /
+                float(latest_item.quantity or 0)
+            )
+
+        elif float(product.stock or 0) <= 0.000001:
+
+            product.unit_cost = 0
 
 
 def apply_purchase_contents(
@@ -5581,65 +5775,78 @@ def apply_purchase_contents(
             shipping_cost
         ) = cleaned_payload
 
-    materials_by_id = {}
+    inventory_by_key = {}
 
     for item in clean_items:
 
-        material = (
-            db.query(RawMaterial)
-            .filter(
-                RawMaterial.id
-                ==
-                item["raw_material_id"]
-            )
-            .with_for_update()
-            .first()
-        )
+        key = (item["item_type"], item["inventory_id"])
 
-        if not material:
+        if item["item_type"] == "RESALE":
 
-            raise ValueError(
-                "Una de las materias primas no existe"
+            inventory = (
+                db.query(Product)
+                .filter(Product.id == item["inventory_id"])
+                .with_for_update()
+                .first()
             )
 
-        materials_by_id[material.id] = material
+            if not inventory or not is_resale_product(inventory):
 
-    material_base_total = sum(
+                raise ValueError(
+                    "Uno de los productos de reventa no existe o no está marcado como reventa"
+                )
+
+        else:
+
+            inventory = (
+                db.query(RawMaterial)
+                .filter(RawMaterial.id == item["inventory_id"])
+                .with_for_update()
+                .first()
+            )
+
+            if not inventory:
+
+                raise ValueError(
+                    "Una de las materias primas no existe"
+                )
+
+        inventory_by_key[key] = inventory
+
+    inventory_base_total = sum(
         item["price"]
         for item in clean_items
     )
 
     material_total = 0
+    resale_total = 0
     affected_material_ids = set()
+    affected_product_ids = set()
 
     for item in clean_items:
 
-        material = materials_by_id[
-            item["raw_material_id"]
-        ]
+        key = (item["item_type"], item["inventory_id"])
+        inventory = inventory_by_key[key]
 
         allocated_shipping = 0
 
-        if material_base_total > 0:
+        if inventory_base_total > 0:
 
             allocated_shipping = (
                 shipping_cost
                 *
                 item["price"]
                 /
-                material_base_total
+                inventory_base_total
             )
 
-        final_price = (
-            item["price"]
-            +
-            allocated_shipping
-        )
+        final_price = item["price"] + allocated_shipping
 
         db.add(
             PurchaseItem(
                 purchase_id=purchase.id,
-                raw_material_id=material.id,
+                raw_material_id=item["raw_material_id"],
+                product_id=item["product_id"],
                 quantity=item["quantity"],
                 price=final_price
             )
@@ -5647,25 +5854,27 @@ def apply_purchase_contents(
 
         if adjust_stock:
 
-            purchased_quantity = float(
-                item["quantity"]
-                or
-                0
-            )
+            purchased_quantity = float(item["quantity"] or 0)
 
             if purchased_quantity <= 0:
 
                 raise ValueError(
-                    f"La cantidad comprada de {material.name} debe ser mayor a cero"
+                    f"La cantidad comprada de {inventory.name} debe ser mayor a cero"
                 )
 
             previous_stock = max(
-                float(material.stock or 0),
+                float(inventory.stock or 0),
                 0
             )
 
             previous_unit_cost = max(
-                float(material.cost or 0),
+                float(
+                    inventory.unit_cost
+                    if item["item_type"] == "RESALE"
+                    else inventory.cost
+                )
+                or
+                0,
                 0
             )
 
@@ -5674,27 +5883,30 @@ def apply_purchase_contents(
                 *
                 previous_unit_cost
             )
+            new_stock = previous_stock + purchased_quantity
+            new_unit_cost = (
+                previous_stock_value + final_price
+            ) / new_stock
 
-            new_stock = (
-                previous_stock
-                +
-                purchased_quantity
-            )
+            if item["item_type"] == "RESALE":
 
-            material.cost = (
-                (
-                    previous_stock_value
-                    +
-                    final_price
-                )
-                /
-                new_stock
-            )
+                inventory.unit_cost = new_unit_cost
 
-            material.stock = new_stock
+            else:
 
-        material_total += final_price
-        affected_material_ids.add(material.id)
+                inventory.cost = new_unit_cost
+
+            inventory.stock = new_stock
+
+        if item["item_type"] == "RESALE":
+
+            resale_total += final_price
+            affected_product_ids.add(inventory.id)
+
+        else:
+
+            material_total += final_price
+            affected_material_ids.add(inventory.id)
 
     extra_total = sum(
         item["price"]
@@ -5703,22 +5915,11 @@ def apply_purchase_contents(
 
     unallocated_shipping = (
         shipping_cost
-        if material_base_total <= 0
-        else
-        0
+        if inventory_base_total <= 0
+        else 0
     )
-
-    expense_total = (
-        extra_total
-        +
-        unallocated_shipping
-    )
-
-    total = (
-        material_total
-        +
-        expense_total
-    )
+    expense_total = extra_total + unallocated_shipping
+    total = material_total + resale_total + expense_total
 
     if total <= 0:
 
@@ -5727,38 +5928,21 @@ def apply_purchase_contents(
         )
 
     metadata = {
-        "shipping_cost":
-        shipping_cost,
-        "extra_items":
-        clean_extra_items,
-        "notes":
-        str(
-            data.get(
-                "notes",
-                ""
-            )
-            or
-            ""
-        )
+        "shipping_cost": shipping_cost,
+        "extra_items": clean_extra_items,
+        "notes": str(data.get("notes", "") or "")
     }
 
     purchase.notes = (
         PURCHASE_METADATA_PREFIX
         +
-        json.dumps(
-            metadata,
-            ensure_ascii=False
-        )
+        json.dumps(metadata, ensure_ascii=False)
     )
-
     purchase.total = total
 
-    payment_code, payment_name = (
-        purchase_payment_account(
-            purchase.payment_method
-        )
+    payment_code, payment_name = purchase_payment_account(
+        purchase.payment_method
     )
-
     group_id = str(uuid4())
 
     if material_total > 0:
@@ -5777,6 +5961,22 @@ def apply_purchase_contents(
             )
         )
 
+    if resale_total > 0:
+
+        db.add(
+            JournalEntry(
+                date=purchase.date,
+                concept=f"Compra {purchase.number}",
+                account_code="1.2.03",
+                account_name="Mercadería para reventa",
+                debit=resale_total,
+                credit=0,
+                entry_group=group_id,
+                origin="COMPRA",
+                origin_id=purchase.id
+            )
+        )
+
     if expense_total > 0:
 
         db.add(
@@ -5784,9 +5984,7 @@ def apply_purchase_contents(
                 date=purchase.date,
                 concept=f"Compra {purchase.number}",
                 account_code="5.3.01",
-                account_name=(
-                    "Materiales y gastos de producción"
-                ),
+                account_name="Materiales y gastos de producción",
                 debit=expense_total,
                 credit=0,
                 entry_group=group_id,
@@ -5817,10 +6015,15 @@ def apply_purchase_contents(
             db,
             affected_material_ids
         )
+        recalculate_resale_product_costs(
+            db,
+            affected_product_ids
+        )
 
     return (
         total,
-        affected_material_ids
+        affected_material_ids,
+        affected_product_ids
     )
 
 
@@ -5843,7 +6046,7 @@ def create_purchase_items(
 
     try:
 
-        total, _ = apply_purchase_contents(
+        total, _, _ = apply_purchase_contents(
             db,
             purchase,
             data
@@ -5896,161 +6099,125 @@ def update_purchase(
 
     if not purchase:
 
-        return {
-            "error":
-            "Compra no encontrada"
-        }
+        return {"error": "Compra no encontrada"}
 
     try:
 
-        cleaned_payload = clean_purchase_payload(
-            data
-        )
-
+        cleaned_payload = clean_purchase_payload(data)
         clean_items = cleaned_payload[0]
 
-        old_quantities = (
-            purchase_quantities_by_material(
-                db,
-                purchase.id
-            )
+        old_quantities = purchase_quantities_by_inventory(
+            db,
+            purchase.id
         )
-
         new_quantities = {}
 
         for item in clean_items:
 
-            material_id = item["raw_material_id"]
-
-            new_quantities[material_id] = (
-                new_quantities.get(
-                    material_id,
-                    0
-                )
+            key = (item["item_type"], item["inventory_id"])
+            new_quantities[key] = (
+                new_quantities.get(key, 0)
                 +
                 item["quantity"]
             )
 
-        all_material_ids = (
-            set(old_quantities)
-            |
-            set(new_quantities)
-        )
+        all_keys = set(old_quantities) | set(new_quantities)
+        inventories_by_key = {}
 
-        materials_by_id = {}
+        for key in all_keys:
 
-        for material_id in all_material_ids:
+            item_type, inventory_id = key
 
-            material = (
-                db.query(RawMaterial)
-                .filter(
-                    RawMaterial.id == material_id
+            if item_type == "RESALE":
+
+                inventory = (
+                    db.query(Product)
+                    .filter(Product.id == inventory_id)
+                    .with_for_update()
+                    .first()
                 )
-                .with_for_update()
-                .first()
-            )
 
-            if not material:
+                if inventory and not is_resale_product(inventory):
+
+                    raise ValueError(
+                        f"{inventory.name} ya no está marcado como producto de reventa"
+                    )
+
+            else:
+
+                inventory = (
+                    db.query(RawMaterial)
+                    .filter(RawMaterial.id == inventory_id)
+                    .with_for_update()
+                    .first()
+                )
+
+            if not inventory:
 
                 raise ValueError(
-                    "Una de las materias primas no existe"
+                    "Uno de los artículos de la compra no existe"
                 )
 
             delta = (
-                new_quantities.get(
-                    material_id,
-                    0
-                )
+                new_quantities.get(key, 0)
                 -
-                old_quantities.get(
-                    material_id,
-                    0
-                )
+                old_quantities.get(key, 0)
             )
 
-            if (
-                float(material.stock or 0)
-                +
-                delta
-                <
-                -0.000001
-            ):
+            if float(inventory.stock or 0) + delta < -0.000001:
 
                 raise ValueError(
                     (
-                        f"No se puede reducir esa cantidad de "
-                        f"{material.name} porque parte del stock "
-                        f"ya fue consumido. Stock actual: "
-                        f"{float(material.stock or 0)}"
+                        f"No se puede reducir esa cantidad de {inventory.name} "
+                        "porque parte del stock ya fue consumido. "
+                        f"Stock actual: {float(inventory.stock or 0)}"
                     )
                 )
 
-            materials_by_id[material_id] = (
-                material,
-                delta
-            )
+            inventories_by_key[key] = (inventory, delta)
 
-        old_material_ids = remove_purchase_contents(
+        old_material_ids, old_product_ids = remove_purchase_contents(
             db,
             purchase,
             adjust_stock=False
         )
 
-        for material, delta in materials_by_id.values():
+        for inventory, delta in inventories_by_key.values():
 
-            material.stock = (
-                float(material.stock or 0)
-                +
-                delta
-            )
+            inventory.stock = float(inventory.stock or 0) + delta
 
         purchase.supplier = str(
-            data.get(
-                "supplier",
-                purchase.supplier
-            )
+            data.get("supplier", purchase.supplier)
         ).strip()
-
         purchase.invoice_number = str(
-            data.get(
-                "invoice_number",
-                ""
-            )
-            or
-            ""
+            data.get("invoice_number", "") or ""
         ).strip()
-
         purchase.payment_method = str(
-            data.get(
-                "payment_method",
-                "Caja"
-            )
-            or
-            "Caja"
+            data.get("payment_method", "Caja") or "Caja"
         ).strip()
-
         purchase.date = str(
-            data.get(
-                "date",
-                purchase.date
-            )
+            data.get("date", purchase.date)
         ).strip()
 
-        total, new_material_ids = (
-            apply_purchase_contents(
-                db,
-                purchase,
-                data,
-                adjust_stock=False,
-                cleaned_payload=cleaned_payload
-            )
+        (
+            total,
+            new_material_ids,
+            new_product_ids
+        ) = apply_purchase_contents(
+            db,
+            purchase,
+            data,
+            adjust_stock=False,
+            cleaned_payload=cleaned_payload
         )
 
         recalculate_raw_material_costs(
             db,
-            old_material_ids
-            |
-            new_material_ids
+            old_material_ids | new_material_ids
+        )
+        recalculate_resale_product_costs(
+            db,
+            old_product_ids | new_product_ids
         )
 
         db.commit()
@@ -6058,8 +6225,7 @@ def update_purchase(
         return {
             "message":
             f"Compra {purchase.number} modificada correctamente",
-            "total":
-            total
+            "total": total
         }
 
     except Exception as error:
@@ -6074,6 +6240,8 @@ def update_purchase(
 
 # ================= COMPRAS ITEMS =================
 
+# ================= COMPRAS ITEMS =================
+
 @app.post("/purchase-item/{purchase_id}/{product_id}/{qty}")
 def add_purchase_item(
     purchase_id: int,
@@ -6085,36 +6253,50 @@ def add_purchase_item(
     product = db.query(Product).filter(
         Product.id == product_id
     ).first()
-
     purchase = db.query(Purchase).filter(
         Purchase.id == purchase_id
     ).first()
 
+    if not product or not purchase:
 
-    subtotal = product.price * qty
+        return {
+            "error":
+            "Compra o producto no encontrado"
+        }
 
+    if not is_resale_product(product):
+
+        return {
+            "error":
+            "Este endpoint solo admite productos de reventa"
+        }
+
+    quantity = float(qty or 0)
+
+    if quantity <= 0:
+
+        return {
+            "error":
+            "La cantidad debe ser mayor a cero"
+        }
+
+    unit_cost = max(float(product.unit_cost or 0), 0)
+    subtotal = unit_cost * quantity
 
     item = PurchaseItem(
         purchase_id=purchase.id,
+        raw_material_id=None,
         product_id=product.id,
-        quantity=qty,
-        price=product.price
+        quantity=quantity,
+        price=subtotal
     )
 
-
-    product.stock += qty
-
-    purchase.total += subtotal
-
-
+    product.stock = float(product.stock or 0) + quantity
+    purchase.total = float(purchase.total or 0) + subtotal
     db.add(item)
-
     db.commit()
 
-
-    return {
-        "mensaje": "compra actualizada"
-    }
+    return {"mensaje": "compra actualizada"}
 
 @app.delete("/purchases/{purchase_id}")
 def delete_purchase(
@@ -6135,11 +6317,12 @@ def delete_purchase(
 
     try:
 
-        affected_material_ids = (
-            remove_purchase_contents(
-                db,
-                purchase
-            )
+        (
+            affected_material_ids,
+            affected_product_ids
+        ) = remove_purchase_contents(
+            db,
+            purchase
         )
 
         purchase_number = purchase.number
@@ -6150,6 +6333,10 @@ def delete_purchase(
         recalculate_raw_material_costs(
             db,
             affected_material_ids
+        )
+        recalculate_resale_product_costs(
+            db,
+            affected_product_ids
         )
 
         db.commit()
@@ -7877,6 +8064,12 @@ def resolve_formula_output(
             "El producto terminado seleccionado no existe"
         )
 
+    if is_resale_product(product):
+
+        raise ValueError(
+            "Los productos de reventa no pueden tener fórmula ni lotes de producción"
+        )
+
     return (
         "PRODUCT",
         product.id,
@@ -9402,127 +9595,14 @@ def delete_lot(
             "Lote no encontrado"
         }
 
-    units_produced = max(
-        float(lot.units_produced or 0),
-        0
-    )
-
-    remaining_units = max(
-        float(
-            lot.remaining_units
-            if lot.remaining_units is not None
-            else units_produced
-        ),
-        0
-    )
-
-    formula = db.query(Formula).filter(
-        Formula.id == lot.formula_id
-    ).first()
-
-    material_rows = db.execute(
-        text(
-            """
-            SELECT source
-            FROM lot_materials
-            WHERE lot_id = :lot_id
-            """
-        ),
-        {
-            "lot_id":
-            lot.id
-        }
-    ).mappings().all()
-
-    used_estimated_history = any(
-        row["source"] == "FORMULA_ESTIMATE"
-        for row in material_rows
-    )
-
     try:
 
-        output_type = str(
-            lot.output_type
-            or
-            getattr(
-                formula,
-                "output_type",
-                "PRODUCT"
-            )
-            or
-            "PRODUCT"
-        ).upper()
+        # MODO TEMPORAL DE LIMPIEZA NEUTRA:
+        # se elimina el lote de prueba sin modificar stock de productos,
+        # materias primas, costos ni asientos contables.
+        # Solo se quitan las referencias técnicas necesarias para que
+        # PostgreSQL permita borrar el registro.
 
-        output_item = None
-
-        if output_type == "RAW_MATERIAL":
-
-            output_raw_material_id = (
-                lot.output_raw_material_id
-                or
-                (
-                    formula.output_raw_material_id
-                    if formula
-                    else None
-                )
-            )
-
-            if output_raw_material_id:
-
-                output_item = db.query(RawMaterial).filter(
-                    RawMaterial.id == output_raw_material_id
-                ).first()
-
-        elif formula and formula.output_product_id:
-
-            output_item = db.query(Product).filter(
-                Product.id == formula.output_product_id
-            ).first()
-
-        available_lot_balance = min(
-            remaining_units,
-            units_produced
-        )
-
-        current_output_stock = (
-            max(
-                float(output_item.stock or 0),
-                0
-            )
-            if output_item
-            else 0
-        )
-
-        output_quantity_removed = min(
-            available_lot_balance,
-            current_output_stock
-        )
-
-        restore_ratio = (
-            output_quantity_removed / units_produced
-            if units_produced > 0
-            else 0
-        )
-
-        if material_rows and restore_ratio > 0:
-
-            restore_lot_material_consumption(
-                db,
-                lot.id,
-                restore_ratio=restore_ratio
-            )
-
-        if output_item:
-
-            output_item.stock = (
-                current_output_stock
-                -
-                output_quantity_removed
-            )
-
-        # MODO TEMPORAL DE LIMPIEZA:
-        # se quitan solamente las referencias que impiden borrar el lote.
-        # Las ventas, movimientos, otros lotes y asientos quedan existentes.
         deleted_sale_links = (
             db.query(SaleLotAllocation)
             .filter(
@@ -9577,18 +9657,6 @@ def delete_lot(
 
         db.delete(lot)
         db.flush()
-
-        if (
-            output_type == "RAW_MATERIAL"
-            and
-            output_item
-        ):
-
-            recalculate_intermediate_material_cost(
-                db,
-                output_item.id
-            )
-
         db.commit()
 
         removed_links = (
@@ -9601,59 +9669,27 @@ def delete_lot(
             int(deleted_intermediate_consumer_links or 0)
         )
 
-        warning_parts = []
+        warning_parts = [
+            "No se descontó stock de productos ni se repusieron materias primas.",
+            "Los asientos contables no fueron modificados."
+        ]
 
         if removed_links:
 
-            warning_parts.append(
+            warning_parts.insert(
+                0,
                 "Se quitaron "
                 f"{removed_links} vínculos técnicos con ventas, movimientos "
-                "u otros lotes. Esos registros no fueron eliminados."
+                "u otros lotes. Esos registros permanecen guardados."
             )
-
-        if not material_rows:
-
-            warning_parts.append(
-                "El lote no tenía detalle de materias primas, por lo que no "
-                "se repuso ningún insumo."
-            )
-
-        elif used_estimated_history:
-
-            warning_parts.append(
-                "Las materias primas se repusieron usando la estimación "
-                "histórica disponible."
-            )
-
-        elif restore_ratio < 0.999999:
-
-            warning_parts.append(
-                "Se repusieron materias primas solamente en proporción al "
-                "saldo disponible eliminado."
-            )
-
-        if not output_item:
-
-            warning_parts.append(
-                "No se pudo identificar el producto o materia prima resultante, "
-                "por lo que su stock no fue modificado."
-            )
-
-        warning_parts.append(
-            "Los asientos contables no fueron modificados; corregilos "
-            "manualmente desde el Libro Diario."
-        )
 
         return {
             "message":
             f"Lote {lot_number} eliminado correctamente",
-            "materials_restored": (
-                bool(material_rows)
-                and
-                restore_ratio > 0
-            ),
-            "restored_ratio": restore_ratio,
-            "output_quantity_removed": output_quantity_removed,
+            "stock_unchanged": True,
+            "materials_unchanged": True,
+            "accounting_unchanged": True,
+            "temporary_cleanup_mode": True,
             "removed_sale_links": int(deleted_sale_links or 0),
             "removed_stock_links": int(deleted_stock_links or 0),
             "removed_intermediate_links": (
@@ -9661,9 +9697,6 @@ def delete_lot(
                 +
                 int(deleted_intermediate_consumer_links or 0)
             ),
-            "used_estimated_history": used_estimated_history,
-            "accounting_unchanged": True,
-            "temporary_cleanup_mode": True,
             "warning": " ".join(warning_parts)
         }
 
