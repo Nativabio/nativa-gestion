@@ -5486,9 +5486,9 @@ def clean_purchase_payload(
 
         name = str(item.get("name", "") or "").strip()
         category = str(
-            item.get("category", "Otro")
+            item.get("category", "Herramientas y utensilios")
             or
-            "Otro"
+            "Herramientas y utensilios"
         ).strip()
         quantity = float(item.get("quantity", 0) or 0)
         price = float(item.get("price", 0) or 0)
@@ -5500,16 +5500,17 @@ def clean_purchase_payload(
         if quantity <= 0:
 
             raise ValueError(
-                "Las cantidades de otros gastos deben ser mayores a cero"
+                "Las cantidades de los materiales de producción deben ser mayores a cero"
             )
 
         if price < 0:
 
             raise ValueError(
-                "Los importes no pueden ser negativos"
+                "Los importes de los materiales de producción no pueden ser negativos"
             )
 
         clean_extra_items.append({
+            "item_type": "PRODUCTION_MATERIAL",
             "name": name,
             "category": category,
             "quantity": quantity,

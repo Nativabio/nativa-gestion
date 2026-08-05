@@ -18,13 +18,25 @@ class Product(Base):
 
     stock = Column(Float, default=0)
 
+    product_type = Column(String, default="MANUFACTURED")
+
+    unit_cost = Column(Float, default=0)
+
+    margin_percent = Column(Float, default=40)
+
 class ProductCreate(BaseModel):
 
     name: str
 
     price: float = 0
 
-    stock: float = 0    
+    stock: float = 0
+
+    product_type: str = "MANUFACTURED"
+
+    unit_cost: float = 0
+
+    margin_percent: float = 40
 
 # ================= PROVEEDORES =================
 
@@ -309,13 +321,25 @@ class PurchaseItem(Base):
 
     purchase_id = Column(Integer, ForeignKey("purchases.id"))
 
-    raw_material_id = Column(Integer, ForeignKey("raw_materials.id"))
+    raw_material_id = Column(
+        Integer,
+        ForeignKey("raw_materials.id"),
+        nullable=True
+    )
+
+    product_id = Column(
+        Integer,
+        ForeignKey("products.id"),
+        nullable=True
+    )
 
     quantity = Column(Float)
 
     price = Column(Float)
 
     raw_material = relationship("RawMaterial")
+
+    product = relationship("Product")
 
 
 # ================= CONTABILIDAD =================

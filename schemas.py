@@ -6,8 +6,11 @@ from typing import Optional
 
 class ProductCreate(BaseModel):
     name: str
-    price: float
-    stock: float
+    price: float = 0
+    stock: float = 0
+    product_type: str = "MANUFACTURED"
+    unit_cost: float = 0
+    margin_percent: float = 40
 
 
 # ================= MATERIAS PRIMAS =================
