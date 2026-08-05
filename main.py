@@ -2035,16 +2035,6 @@ def delete_product(
             .count()
         )
 
-        purchase_item_count = (
-            db.query(PurchaseItem)
-            .filter(
-                PurchaseItem.product_id
-                ==
-                product.id
-            )
-            .count()
-        )
-
         db.query(Formula).filter(
             Formula.output_product_id == product.id
         ).update(
@@ -2075,16 +2065,6 @@ def delete_product(
             synchronize_session=False
         )
 
-        db.query(PurchaseItem).filter(
-            PurchaseItem.product_id == product.id
-        ).update(
-            {
-                PurchaseItem.product_id:
-                historical_product.id
-            },
-            synchronize_session=False
-        )
-
         product_name = product.name
 
         db.delete(product)
@@ -2096,8 +2076,6 @@ def delete_product(
             sale_item_count
             +
             stock_movement_item_count
-            +
-            purchase_item_count
         )
 
         return {
