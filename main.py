@@ -8285,8 +8285,20 @@ def recalculate_intermediate_material_cost(
 
 def restore_lot_material_consumption(
     db,
-    lot_id
+    lot_id,
+    restore_ratio=1.0
 ):
+
+    # Para lotes antiguos parcialmente consumidos, se repone únicamente
+    # la proporción de materias primas correspondiente al saldo que todavía
+    # estaba disponible. Esto evita inflar el stock al borrar el historial.
+    restore_ratio = min(
+        max(
+            float(restore_ratio or 0),
+            0
+        ),
+        1
+    )
 
     affected_intermediate_ids = set()
 
@@ -8307,7 +8319,11 @@ def restore_lot_material_consumption(
             source_lot.remaining_units = (
                 float(source_lot.remaining_units or 0)
                 +
-                float(allocation.quantity or 0)
+                (
+                    float(allocation.quantity or 0)
+                    *
+                    restore_ratio
+                )
             )
 
             source_lot.status = "Disponible"
@@ -8345,7 +8361,11 @@ def restore_lot_material_consumption(
             raw.stock = (
                 float(raw.stock or 0)
                 +
-                float(row["quantity"] or 0)
+                (
+                    float(row["quantity"] or 0)
+                    *
+                    restore_ratio
+                )
             )
 
             if int(raw.is_intermediate or 0):
@@ -8928,59 +8948,12 @@ def get_lots(
             (lot.origin or "PRODUCTION") == "PRODUCTION"
         )
 
-        can_delete = (
-            is_production_lot
-            and
-            not has_consumption
-            and
-            bool(materials)
-        )
-
-        if not is_production_lot:
-
-            delete_block_reason = (
-                "El lote fue generado por un ajuste de stock. "
-                "Eliminá primero ese ajuste."
-            )
-
-        elif has_sale_allocations:
-
-            delete_block_reason = (
-                "El lote está vinculado a una venta. "
-                "Eliminá primero la venta de prueba correspondiente."
-            )
-
-        elif has_stock_allocations:
-
-            delete_block_reason = (
-                "El lote está vinculado a un movimiento de stock. "
-                "Eliminá primero ese movimiento."
-            )
-
-        elif used_as_intermediate_source:
-
-            delete_block_reason = (
-                "El lote fue utilizado para elaborar otro lote. "
-                "Eliminá primero el lote que lo consumió."
-            )
-
-        elif has_balance_difference:
-
-            delete_block_reason = (
-                "El lote ya tiene unidades consumidas o ajustadas. "
-                "Revisá y eliminá primero los movimientos relacionados."
-            )
-
-        elif not materials:
-
-            delete_block_reason = (
-                "El lote no tiene detalle de materias primas y no puede "
-                "revertirse de forma segura."
-            )
-
-        else:
-
-            delete_block_reason = ""
+        # MODO TEMPORAL DE LIMPIEZA:
+        # todos los lotes pueden eliminarse aunque estén vinculados a ventas,
+        # movimientos de stock, ajustes u otros lotes. El endpoint elimina
+        # solamente los vínculos técnicos necesarios y no toca la contabilidad.
+        can_delete = True
+        delete_block_reason = ""
 
         result.append({
             "id": lot.id,
@@ -9040,6 +9013,7 @@ def get_lots(
             "has_stock_movements": has_stock_allocations,
             "used_as_intermediate_source": used_as_intermediate_source,
             "has_consumption": has_consumption,
+            "has_balance_difference": has_balance_difference,
             "can_edit": is_production_lot,
             "can_delete": can_delete,
             "delete_block_reason": delete_block_reason
@@ -9396,93 +9370,23 @@ def delete_lot(
             "Lote no encontrado"
         }
 
-    if (lot.origin or "PRODUCTION") != "PRODUCTION":
-
-        return {
-            "error":
-            "Este lote pertenece a un ajuste de stock y debe eliminarse desde ese ajuste"
-        }
-
-    units_produced = float(
-        lot.units_produced or 0
+    units_produced = max(
+        float(lot.units_produced or 0),
+        0
     )
 
-    remaining_units = float(
-        lot.remaining_units
-        if lot.remaining_units is not None
-        else units_produced
+    remaining_units = max(
+        float(
+            lot.remaining_units
+            if lot.remaining_units is not None
+            else units_produced
+        ),
+        0
     )
-
-    sale_allocations_count = (
-        db.query(SaleLotAllocation).filter(
-            SaleLotAllocation.lot_id == lot.id
-        ).count()
-    )
-
-    stock_allocations_count = (
-        db.query(StockMovementLotAllocation).filter(
-            StockMovementLotAllocation.lot_id == lot.id
-        ).count()
-    )
-
-    intermediate_allocations_count = (
-        db.query(LotMaterialSourceAllocation).filter(
-            LotMaterialSourceAllocation.source_lot_id == lot.id
-        ).count()
-    )
-
-    if sale_allocations_count:
-
-        return {
-            "error":
-            (
-                "No se puede eliminar este lote porque está vinculado "
-                "a una venta. Eliminá primero la venta de prueba."
-            )
-        }
-
-    if stock_allocations_count:
-
-        return {
-            "error":
-            (
-                "No se puede eliminar este lote porque está vinculado "
-                "a un movimiento de stock. Eliminá primero ese movimiento."
-            )
-        }
-
-    if intermediate_allocations_count:
-
-        return {
-            "error":
-            (
-                "No se puede eliminar este lote porque fue utilizado "
-                "para elaborar otro lote. Eliminá primero el lote consumidor."
-            )
-        }
-
-    if abs(
-        remaining_units - units_produced
-    ) > 0.000001:
-
-        return {
-            "error":
-            (
-                "No se puede eliminar este lote porque ya tiene unidades "
-                "consumidas o ajustadas. Eliminá primero los movimientos relacionados."
-            )
-        }
 
     formula = db.query(Formula).filter(
         Formula.id == lot.formula_id
     ).first()
-
-    if not formula:
-
-        return {
-            "error":
-            "No se encontró la fórmula asociada al lote"
-        }
 
     material_rows = db.execute(
         text(
@@ -9498,13 +9402,6 @@ def delete_lot(
         }
     ).mappings().all()
 
-    if not material_rows:
-
-        return {
-            "error":
-            "Este lote no tiene detalle de materias primas y no puede eliminarse de forma segura"
-        }
-
     used_estimated_history = any(
         row["source"] == "FORMULA_ESTIMATE"
         for row in material_rows
@@ -9512,42 +9409,148 @@ def delete_lot(
 
     try:
 
-        output_type, output_item = formula_output_data(
-            db,
-            formula
-        )
+        output_type = str(
+            lot.output_type
+            or
+            getattr(
+                formula,
+                "output_type",
+                "PRODUCT"
+            )
+            or
+            "PRODUCT"
+        ).upper()
 
-        if (
-            float(output_item.stock or 0)
-            +
-            0.000001
-            <
-            units_produced
-        ):
+        output_item = None
 
-            raise ValueError(
-                "El stock actual es menor que la cantidad producida por el lote"
+        if output_type == "RAW_MATERIAL":
+
+            output_raw_material_id = (
+                lot.output_raw_material_id
+                or
+                (
+                    formula.output_raw_material_id
+                    if formula
+                    else None
+                )
             )
 
-        restore_lot_material_consumption(
-            db,
-            lot.id
-        )
+            if output_raw_material_id:
 
-        output_item.stock = (
-            float(output_item.stock or 0)
-            -
+                output_item = db.query(RawMaterial).filter(
+                    RawMaterial.id == output_raw_material_id
+                ).first()
+
+        elif formula and formula.output_product_id:
+
+            output_item = db.query(Product).filter(
+                Product.id == formula.output_product_id
+            ).first()
+
+        available_lot_balance = min(
+            remaining_units,
             units_produced
         )
 
-        # La eliminación corrige únicamente stock y relaciones del lote.
-        # Los asientos contables quedan intactos para que puedan ajustarse
-        # manualmente desde el Libro Diario.
+        current_output_stock = (
+            max(
+                float(output_item.stock or 0),
+                0
+            )
+            if output_item
+            else 0
+        )
+
+        output_quantity_removed = min(
+            available_lot_balance,
+            current_output_stock
+        )
+
+        restore_ratio = (
+            output_quantity_removed / units_produced
+            if units_produced > 0
+            else 0
+        )
+
+        if material_rows and restore_ratio > 0:
+
+            restore_lot_material_consumption(
+                db,
+                lot.id,
+                restore_ratio=restore_ratio
+            )
+
+        if output_item:
+
+            output_item.stock = (
+                current_output_stock
+                -
+                output_quantity_removed
+            )
+
+        # MODO TEMPORAL DE LIMPIEZA:
+        # se quitan solamente las referencias que impiden borrar el lote.
+        # Las ventas, movimientos, otros lotes y asientos quedan existentes.
+        deleted_sale_links = (
+            db.query(SaleLotAllocation)
+            .filter(
+                SaleLotAllocation.lot_id == lot.id
+            )
+            .delete(
+                synchronize_session=False
+            )
+        )
+
+        deleted_stock_links = (
+            db.query(StockMovementLotAllocation)
+            .filter(
+                StockMovementLotAllocation.lot_id == lot.id
+            )
+            .delete(
+                synchronize_session=False
+            )
+        )
+
+        deleted_intermediate_source_links = (
+            db.query(LotMaterialSourceAllocation)
+            .filter(
+                LotMaterialSourceAllocation.source_lot_id == lot.id
+            )
+            .delete(
+                synchronize_session=False
+            )
+        )
+
+        deleted_intermediate_consumer_links = (
+            db.query(LotMaterialSourceAllocation)
+            .filter(
+                LotMaterialSourceAllocation.consumer_lot_id == lot.id
+            )
+            .delete(
+                synchronize_session=False
+            )
+        )
+
+        db.execute(
+            text(
+                "DELETE FROM lot_materials WHERE lot_id = :lot_id"
+            ),
+            {
+                "lot_id":
+                lot.id
+            }
+        )
+
+        lot_number = lot.lot_number
 
         db.delete(lot)
         db.flush()
 
-        if output_type == "RAW_MATERIAL":
+        if (
+            output_type == "RAW_MATERIAL"
+            and
+            output_item
+        ):
 
             recalculate_intermediate_material_cost(
                 db,
@@ -9556,25 +9559,80 @@ def delete_lot(
 
         db.commit()
 
+        removed_links = (
+            int(deleted_sale_links or 0)
+            +
+            int(deleted_stock_links or 0)
+            +
+            int(deleted_intermediate_source_links or 0)
+            +
+            int(deleted_intermediate_consumer_links or 0)
+        )
+
+        warning_parts = []
+
+        if removed_links:
+
+            warning_parts.append(
+                "Se quitaron "
+                f"{removed_links} vínculos técnicos con ventas, movimientos "
+                "u otros lotes. Esos registros no fueron eliminados."
+            )
+
+        if not material_rows:
+
+            warning_parts.append(
+                "El lote no tenía detalle de materias primas, por lo que no "
+                "se repuso ningún insumo."
+            )
+
+        elif used_estimated_history:
+
+            warning_parts.append(
+                "Las materias primas se repusieron usando la estimación "
+                "histórica disponible."
+            )
+
+        elif restore_ratio < 0.999999:
+
+            warning_parts.append(
+                "Se repusieron materias primas solamente en proporción al "
+                "saldo disponible eliminado."
+            )
+
+        if not output_item:
+
+            warning_parts.append(
+                "No se pudo identificar el producto o materia prima resultante, "
+                "por lo que su stock no fue modificado."
+            )
+
+        warning_parts.append(
+            "Los asientos contables no fueron modificados; corregilos "
+            "manualmente desde el Libro Diario."
+        )
+
         return {
             "message":
-            f"Lote {lot.lot_number} eliminado correctamente",
-            "materials_restored": True,
+            f"Lote {lot_number} eliminado correctamente",
+            "materials_restored": (
+                bool(material_rows)
+                and
+                restore_ratio > 0
+            ),
+            "restored_ratio": restore_ratio,
+            "output_quantity_removed": output_quantity_removed,
+            "removed_sale_links": int(deleted_sale_links or 0),
+            "removed_stock_links": int(deleted_stock_links or 0),
+            "removed_intermediate_links": (
+                int(deleted_intermediate_source_links or 0)
+                +
+                int(deleted_intermediate_consumer_links or 0)
+            ),
             "used_estimated_history": used_estimated_history,
             "accounting_unchanged": True,
-            "warning": (
-                (
-                    "Las materias primas se repusieron según la estimación "
-                    "histórica. Los asientos contables no fueron modificados; "
-                    "corregilos manualmente desde el Libro Diario."
-                )
-                if used_estimated_history
-                else
-                (
-                    "Los asientos contables no fueron modificados; "
-                    "corregilos manualmente desde el Libro Diario."
-                )
-            )
+            "temporary_cleanup_mode": True,
+            "warning": " ".join(warning_parts)
         }
 
     except Exception as error:
