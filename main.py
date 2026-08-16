@@ -5818,6 +5818,15 @@ def apply_purchase_contents(
         item["price"]
         for item in clean_items
     )
+    extra_base_total = sum(
+        item["price"]
+        for item in clean_extra_items
+    )
+    allocation_base_total = (
+        inventory_base_total
+        +
+        extra_base_total
+    )
 
     material_total = 0
     resale_total = 0
@@ -5831,14 +5840,14 @@ def apply_purchase_contents(
 
         allocated_shipping = 0
 
-        if inventory_base_total > 0:
+        if allocation_base_total > 0:
 
             allocated_shipping = (
                 shipping_cost
                 *
                 item["price"]
                 /
-                inventory_base_total
+                allocation_base_total
             )
 
         final_price = item["price"] + allocated_shipping
@@ -5909,14 +5918,41 @@ def apply_purchase_contents(
             material_total += final_price
             affected_material_ids.add(inventory.id)
 
-    extra_total = sum(
-        item["price"]
-        for item in clean_extra_items
-    )
+    extra_total = 0
+    extra_items_with_shipping = []
+
+    for item in clean_extra_items:
+
+        allocated_shipping = 0
+
+        if allocation_base_total > 0:
+
+            allocated_shipping = (
+                shipping_cost
+                *
+                item["price"]
+                /
+                allocation_base_total
+            )
+
+        final_price = (
+            item["price"]
+            +
+            allocated_shipping
+        )
+
+        extra_total += final_price
+
+        extra_items_with_shipping.append({
+            **item,
+            "base_price": item["price"],
+            "shipping_allocated": allocated_shipping,
+            "final_price": final_price
+        })
 
     unallocated_shipping = (
         shipping_cost
-        if inventory_base_total <= 0
+        if allocation_base_total <= 0
         else 0
     )
     expense_total = extra_total + unallocated_shipping
@@ -5930,7 +5966,7 @@ def apply_purchase_contents(
 
     metadata = {
         "shipping_cost": shipping_cost,
-        "extra_items": clean_extra_items,
+        "extra_items": extra_items_with_shipping,
         "notes": str(data.get("notes", "") or "")
     }
 
