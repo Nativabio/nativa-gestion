@@ -8963,7 +8963,27 @@ def replace_lot_production_journal(
         # el traspaso de materiales no cambia el total de esa cuenta. La mano
         # de obra sí se incorpora al valor del intermedio para no reconocerla
         # dos veces: primero como gasto y luego dentro del costo de venta.
+        material_cost = float(lot.material_cost or 0)
         labor_cost = float(lot.labor_cost or 0)
+
+        # El oleato/intermedio sigue siendo Materia Prima.
+        # Registramos la transformación para que el lote tenga trazabilidad
+        # contable aun cuando la mano de obra sea 0. El movimiento neto de
+        # Materia Prima es cero porque salen insumos y entra el intermedio.
+        if material_cost > 0:
+
+            registrar_asiento(
+                db=db,
+                fecha=production_date,
+                concepto=concept,
+                debe_codigo="1.2.01",
+                debe_nombre="Materia Prima",
+                haber_codigo="1.2.01",
+                haber_nombre="Materia Prima",
+                importe=material_cost,
+                origin="PRODUCCION",
+                origin_id=lot.id
+            )
 
         if labor_cost > 0:
 
