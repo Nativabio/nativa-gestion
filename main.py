@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm import joinedload
 from sqlalchemy import text
 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 import base64
 import hashlib
 import hmac
@@ -31,6 +31,7 @@ from models import (
     StockMovementLotAllocation,
     Purchase,
     PurchaseItem,
+    PurchaseInstallment,
     Accounting,
     Formula,
     FormulaItem,
@@ -670,6 +671,13 @@ def create_default_accounts():
         {
             "code": "2.1.03",
             "name": "Tarjeta de crédito a pagar",
+            "type": "PASIVO",
+            "category": "PASIVO"
+        },
+
+        {
+            "code": "2.1.04",
+            "name": "Cuotas de tarjeta a vencer",
             "type": "PASIVO",
             "category": "PASIVO"
         },
@@ -5643,6 +5651,148 @@ def purchase_payment_account(
     )
 
 
+def purchase_installments_count(purchase, data):
+    if normalize_account_label(purchase.payment_method) not in {
+        "tarjeta",
+        "tarjeta de credito"
+    }:
+        return 0
+
+    raw_value = data.get("installments_count", 0)
+    if raw_value in {None, ""}:
+        return 0
+
+    try:
+        count = int(raw_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("La cantidad de cuotas no es válida") from error
+
+    if count < 0 or count > 60:
+        raise ValueError("La cantidad de cuotas debe estar entre 0 y 60")
+
+    return count
+
+
+def remove_purchase_installments(db, purchase):
+    installments = db.query(PurchaseInstallment).filter(
+        PurchaseInstallment.purchase_id == purchase.id
+    ).all()
+    installment_ids = [
+        item.id for item in installments if item.id is not None
+    ]
+
+    if installment_ids:
+        db.query(JournalEntry).filter(
+            JournalEntry.origin == "VENCIMIENTO_TARJETA",
+            JournalEntry.origin_id.in_(installment_ids)
+        ).delete(synchronize_session=False)
+
+    db.query(JournalEntry).filter(
+        JournalEntry.origin == "CUOTAS_TARJETA",
+        JournalEntry.origin_id == purchase.id
+    ).delete(synchronize_session=False)
+
+    for installment in installments:
+        db.delete(installment)
+
+
+def create_purchase_installments(db, purchase, total, count):
+    if count <= 0:
+        return
+
+    purchase_date = parse_date_value(purchase.date, "fecha de compra")
+    total = round(float(total or 0), 2)
+    base_amount = round(total / count, 2)
+    remaining = total
+
+    for number in range(1, count + 1):
+        amount = base_amount if number < count else round(remaining, 2)
+        remaining = round(remaining - amount, 2)
+
+        db.add(PurchaseInstallment(
+            purchase_id=purchase.id,
+            installment_number=number,
+            total_installments=count,
+            due_date=str(purchase_date + timedelta(days=30 * number)),
+            amount=amount,
+            posted=0
+        ))
+
+    db.flush()
+
+    registrar_asiento(
+        db=db,
+        fecha=purchase.date,
+        concepto=f"Cuotas tarjeta compra {purchase.number}",
+        debe_codigo="2.1.03",
+        debe_nombre="Tarjeta de crédito a pagar",
+        haber_codigo="2.1.04",
+        haber_nombre="Cuotas de tarjeta a vencer",
+        importe=total,
+        origin="CUOTAS_TARJETA",
+        origin_id=purchase.id
+    )
+
+
+def post_due_credit_card_installments(db):
+    today = datetime.now(
+        timezone(timedelta(hours=-3))
+    ).date()
+    today_text = str(today)
+
+    pending = db.query(PurchaseInstallment).filter(
+        PurchaseInstallment.posted == 0,
+        PurchaseInstallment.due_date <= today_text
+    ).order_by(
+        PurchaseInstallment.due_date.asc(),
+        PurchaseInstallment.id.asc()
+    ).all()
+
+    for installment in pending:
+        purchase = db.query(Purchase).filter(
+            Purchase.id == installment.purchase_id
+        ).first()
+        if not purchase:
+            continue
+
+        existing = db.query(JournalEntry).filter(
+            JournalEntry.origin == "VENCIMIENTO_TARJETA",
+            JournalEntry.origin_id == installment.id
+        ).first()
+
+        if existing:
+            installment.posted = 1
+            installment.posted_date = installment.posted_date or today_text
+            installment.journal_group = (
+                installment.journal_group or existing.entry_group
+            )
+            continue
+
+        group_id = registrar_asiento(
+            db=db,
+            fecha=installment.due_date,
+            concepto=(
+                f"Cuota {installment.installment_number}/"
+                f"{installment.total_installments} tarjeta "
+                f"- Compra {purchase.number}"
+            ),
+            debe_codigo="2.1.04",
+            debe_nombre="Cuotas de tarjeta a vencer",
+            haber_codigo="2.1.03",
+            haber_nombre="Tarjeta de crédito a pagar",
+            importe=round(float(installment.amount or 0), 2),
+            origin="VENCIMIENTO_TARJETA",
+            origin_id=installment.id
+        )
+
+        installment.posted = 1
+        installment.posted_date = today_text
+        installment.journal_group = group_id
+
+    if pending:
+        db.flush()
+
+
 def clean_purchase_payload(
     data
 ):
@@ -5864,6 +6014,11 @@ def remove_purchase_contents(
                     -
                     quantity
                 )
+
+    remove_purchase_installments(
+        db,
+        purchase
+    )
 
     for item in purchase_items:
 
@@ -6278,6 +6433,19 @@ def apply_purchase_contents(
     )
 
     db.flush()
+
+    installments_count = purchase_installments_count(
+        purchase,
+        data
+    )
+
+    if installments_count > 0:
+        create_purchase_installments(
+            db,
+            purchase,
+            total,
+            installments_count
+        )
 
     if not adjust_stock:
 
@@ -7206,6 +7374,8 @@ def create_journal_entry(
 def get_journal_entries(
     db: Session = Depends(get_db)
 ):
+
+    post_due_credit_card_installments(db)
 
     ensure_journal_entry_numbers(db)
 

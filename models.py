@@ -314,6 +314,33 @@ class Purchase(Base):
 
 
 
+class PurchaseInstallment(Base):
+    __tablename__ = "purchase_installments"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    purchase_id = Column(
+        Integer,
+        ForeignKey("purchases.id", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    installment_number = Column(Integer, nullable=False)
+
+    total_installments = Column(Integer, nullable=False)
+
+    due_date = Column(String, nullable=False, index=True)
+
+    amount = Column(Float, default=0)
+
+    posted = Column(Integer, default=0, index=True)
+
+    posted_date = Column(String)
+
+    journal_group = Column(String)
+
+
+
 class PurchaseItem(Base):
     __tablename__ = "purchase_items"
 
