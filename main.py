@@ -5421,6 +5421,7 @@ def get_purchases(
     )
 
     purchase_items = db.query(PurchaseItem).all()
+    purchase_installments = db.query(PurchaseInstallment).all()
     raw_materials = db.query(RawMaterial).all()
     products = db.query(Product).all()
     suppliers = db.query(Supplier).all()
@@ -5495,6 +5496,30 @@ def get_purchases(
             []
         ).append(item_data)
 
+    installments_by_purchase = {}
+
+    for installment in purchase_installments:
+        installments_by_purchase.setdefault(
+            installment.purchase_id,
+            []
+        ).append({
+            "id": installment.id,
+            "installment_number": installment.installment_number,
+            "total_installments": installment.total_installments,
+            "due_date": installment.due_date,
+            "amount": float(installment.amount or 0),
+            "posted": bool(installment.posted),
+            "posted_date": installment.posted_date
+        })
+
+    for schedule in installments_by_purchase.values():
+        schedule.sort(
+            key=lambda item: (
+                item["installment_number"],
+                item["id"]
+            )
+        )
+
     result = []
 
     for purchase in purchases:
@@ -5557,7 +5582,19 @@ def get_purchases(
             ),
             "extra_items": extra_items,
             "total": float(purchase.total or 0),
-            "items": items_by_purchase.get(purchase.id, [])
+            "items": items_by_purchase.get(purchase.id, []),
+            "installments": installments_by_purchase.get(
+                purchase.id,
+                []
+            ),
+            "installments_count": (
+                installments_by_purchase.get(
+                    purchase.id,
+                    [{}]
+                )[0].get("total_installments", 0)
+                if installments_by_purchase.get(purchase.id)
+                else 0
+            )
         })
 
     return result
@@ -6539,6 +6576,21 @@ def update_purchase(
 
         return {"error": "Compra no encontrada"}
 
+    posted_installment = db.query(PurchaseInstallment).filter(
+        PurchaseInstallment.purchase_id == purchase.id,
+        PurchaseInstallment.posted == 1
+    ).first()
+
+    if posted_installment:
+        return {
+            "error":
+            (
+                "No se puede modificar esta compra porque ya tiene "
+                "cuotas contabilizadas como exigibles. "
+                "El historial contable se conserva sin cambios."
+            )
+        }
+
     try:
 
         cleaned_payload = clean_purchase_payload(data)
@@ -6751,6 +6803,21 @@ def delete_purchase(
         return {
             "error":
             "Compra no encontrada"
+        }
+
+    posted_installment = db.query(PurchaseInstallment).filter(
+        PurchaseInstallment.purchase_id == purchase.id,
+        PurchaseInstallment.posted == 1
+    ).first()
+
+    if posted_installment:
+        return {
+            "error":
+            (
+                "No se puede eliminar esta compra porque ya tiene "
+                "cuotas contabilizadas como exigibles. "
+                "El historial contable se conserva sin cambios."
+            )
         }
 
     try:
