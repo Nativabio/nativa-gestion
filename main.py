@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import time
+import unicodedata
 from uuid import uuid4
 
 from database import SessionLocal, Base, engine
@@ -569,7 +570,7 @@ def create_default_accounts():
         },
 
         {
-            "code": "1.1.03",
+            "code": "1.1.06",
             "name": "Mercado Pago",
             "type": "ACTIVO",
             "category": "ACTIVO"
@@ -611,6 +612,41 @@ def create_default_accounts():
         },
 
         {
+            "code": "1.2.04",
+            "name": "Packaging",
+            "type": "ACTIVO",
+            "category": "ACTIVO"
+        },
+
+        {
+            "code": "1.3.01",
+            "name": "Materiales",
+            "type": "ACTIVO",
+            "category": "ACTIVO"
+        },
+
+        {
+            "code": "1.3.02",
+            "name": "Amort. Acum. Materiales",
+            "type": "ACTIVO",
+            "category": "REG ACTIVO"
+        },
+
+        {
+            "code": "1.3.03",
+            "name": "Capacitación",
+            "type": "ACTIVO",
+            "category": "ACTIVO"
+        },
+
+        {
+            "code": "1.3.04",
+            "name": "Amort. Acum. Capacitación",
+            "type": "ACTIVO",
+            "category": "REG ACTIVO"
+        },
+
+        {
             "code": "2.1.01",
             "name": "Proveedores",
             "type": "PASIVO",
@@ -646,57 +682,64 @@ def create_default_accounts():
         },
 
         {
-            "code": "5.1.02",
-            "name": "Packaging",
+            "code": "5.1.14",
+            "name": "Packaging utilizado",
             "type": "COSTO",
             "category": "COSTO"
         },
 
         {
-            "code": "5.1.03",
+            "code": "5.1.15",
+            "name": "Gastos de Sistemas",
+            "type": "GASTO",
+            "category": "GASTO"
+        },
+
+        {
+            "code": "5.1.16",
             "name": "Costo de mercadería vendida",
             "type": "COSTO",
             "category": "COSTO"
         },
 
         {
-            "code": "5.2.01",
-            "name": "Gasto de Mano de Obra",
+            "code": "5.1.02",
+            "name": "Mano de obra",
             "type": "GASTO",
             "category": "GASTO"
         },
 
         {
-            "code": "5.3.01",
+            "code": "5.1.12",
             "name": "Materiales y gastos de producción",
             "type": "GASTO",
             "category": "GASTO"
         },
 
         {
-            "code": "5.4.01",
+            "code": "5.1.13",
             "name": "Diferencias de stock",
             "type": "GASTO",
             "category": "GASTO"
         },
 
         {
-            "code": "5.4.02",
-            "name": "Testeo y control de calidad",
+            "code": "5.1.03",
+            "name": "Gastos de testeo",
             "type": "GASTO",
             "category": "GASTO"
         },
 
         {
-            "code": "5.4.03",
-            "name": "Consumo personal de productos",
+            "code": "5.1.04",
+            "name": "Gastos personales",
             "type": "GASTO",
             "category": "GASTO"
         },
 
         {
-            "code": "5.4.04",
-            "name": "Regalos y obsequios",
+            "code": "5.1.07",
+            "name": "Regalos",
             "type": "GASTO",
             "category": "GASTO"
         }
@@ -757,6 +800,122 @@ def create_default_accounts():
 
 
 
+
+# Migra una sola vez las cuentas que quedaron duplicadas o con códigos
+# ocupados por mejoras posteriores. Los importes del diario no se modifican.
+def normalize_account_label(value):
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = value.lower().replace(".", " ").replace("_", " ")
+    return " ".join(value.split())
+
+
+ACCOUNT_TARGETS = {
+    "cuentas a cobrar": ("1.1.04", "Cuentas a Cobrar"),
+    "mercado pago": ("1.1.06", "Mercado Pago"),
+    "mercaderia para reventa": ("1.2.03", "Mercadería para reventa"),
+    "materiales": ("1.3.01", "Materiales"),
+    "amort acum materiales": ("1.3.02", "Amort. Acum. Materiales"),
+    "capacitacion": ("1.3.03", "Capacitación"),
+    "amort acum capacitacion": ("1.3.04", "Amort. Acum. Capacitación"),
+    "mano de obra": ("5.1.02", "Mano de obra"),
+    "gasto de mano de obra": ("5.1.02", "Mano de obra"),
+    "gastos de testeo": ("5.1.03", "Gastos de testeo"),
+    "testeo y control de calidad": ("5.1.03", "Gastos de testeo"),
+    "gastos personales": ("5.1.04", "Gastos personales"),
+    "consumo personal de productos": ("5.1.04", "Gastos personales"),
+    "regalos": ("5.1.07", "Regalos"),
+    "regalos y obsequios": ("5.1.07", "Regalos"),
+    "materiales y gastos de produccion": ("5.1.12", "Materiales y gastos de producción"),
+    "diferencias de stock": ("5.1.13", "Diferencias de stock"),
+    "packaging utilizado": ("5.1.14", "Packaging utilizado"),
+    "gastos de sistemas": ("5.1.15", "Gastos de Sistemas"),
+    "costo de mercaderia vendida": ("5.1.16", "Costo de mercadería vendida")
+}
+
+
+def account_target(code, name, origin=None):
+    normalized = normalize_account_label(name)
+    code = str(code or "").strip()
+
+    if normalized == "packaging":
+        if code == "1.2.04":
+            return ("1.2.04", "Packaging")
+        if code == "5.1.02" or str(origin or "").upper() == "PACKAGING":
+            return ("5.1.14", "Packaging utilizado")
+
+    target = ACCOUNT_TARGETS.get(normalized)
+    if target:
+        return target
+
+    legacy_codes = {
+        "1.01.04": ("1.3.02", "Amort. Acum. Materiales"),
+        "1.2.05": ("1.3.03", "Capacitación"),
+        "1.2.06": ("1.3.04", "Amort. Acum. Capacitación"),
+        "5.2.01": ("5.1.02", "Mano de obra"),
+        "5.3.01": ("5.1.12", "Materiales y gastos de producción"),
+        "5.4.01": ("5.1.13", "Diferencias de stock"),
+        "5.4.02": ("5.1.03", "Gastos de testeo"),
+        "5.4.03": ("5.1.04", "Gastos personales"),
+        "5.4.04": ("5.1.07", "Regalos"),
+        "50405": ("5.1.15", "Gastos de Sistemas")
+    }
+    return legacy_codes.get(code)
+
+
+def migrate_existing_accounts():
+    db = SessionLocal()
+    try:
+        accounts = db.query(Account).order_by(Account.id.asc()).all()
+        records = []
+        for account in accounts:
+            target = account_target(account.code, account.name)
+            records.append((account, str(account.code or ""), target))
+
+        # Libera primero los códigos que van a cambiar para respetar UNIQUE.
+        for account, old_code, target in records:
+            if target and old_code != target[0]:
+                account.code = f"__MIG__{account.id}"
+        db.flush()
+
+        for account, old_code, target in records:
+            if not target:
+                continue
+            target_code, target_name = target
+            current = db.query(Account).filter(Account.code == target_code).first()
+            if current and current.id != account.id:
+                db.query(JournalDetail).filter(
+                    JournalDetail.account_id == account.id
+                ).update(
+                    {JournalDetail.account_id: current.id},
+                    synchronize_session=False
+                )
+                db.delete(account)
+            else:
+                account.code = target_code
+                account.name = target_name
+                account.active = 1
+                db.flush()
+
+        # JournalEntry guarda cuenta como texto: se corrige también el histórico.
+        for entry in db.query(JournalEntry).all():
+            target = account_target(
+                entry.account_code,
+                entry.account_name,
+                entry.origin
+            )
+            if target:
+                entry.account_code, entry.account_name = target
+
+        db.commit()
+    except Exception as error:
+        db.rollback()
+        print("ERROR MIGRANDO PLAN DE CUENTAS:", error)
+    finally:
+        db.close()
+
+
+migrate_existing_accounts()
 create_default_accounts()
 
 
@@ -2574,7 +2733,7 @@ def sale_payment_account(
     if payment_method == "Mercado Pago":
 
         return (
-            "1.1.03",
+            "1.1.06",
             "Mercado Pago"
         )
 
@@ -2946,8 +3105,8 @@ def apply_sale_packaging(
             db=db,
             fecha=sale.date,
             concepto=f"Packaging venta {sale.number}",
-            debe_codigo="5.1.02",
-            debe_nombre="Packaging",
+            debe_codigo="5.1.14",
+            debe_nombre="Packaging utilizado",
             haber_codigo="1.2.01",
             haber_nombre="Materia Prima",
             importe=total_packaging_cost,
@@ -3410,7 +3569,7 @@ def apply_sale_items(
             db=db,
             fecha=sale.date,
             concepto=f"Costo de venta {sale.number}",
-            debe_codigo="5.1.03",
+            debe_codigo="5.1.16",
             debe_nombre="Costo de mercadería vendida",
             haber_codigo="1.2.03",
             haber_nombre="Mercadería para reventa",
@@ -4232,7 +4391,7 @@ STOCK_MOVEMENT_REASONS = {
         "Control de stock",
 
         "account_code":
-        "5.4.01",
+        "5.1.13",
 
         "account_name":
         "Diferencias de stock"
@@ -4243,10 +4402,10 @@ STOCK_MOVEMENT_REASONS = {
         "Testeo de lote",
 
         "account_code":
-        "5.4.02",
+        "5.1.03",
 
         "account_name":
-        "Testeo y control de calidad"
+        "Gastos de testeo"
     },
 
     "PERSONAL_USE": {
@@ -4254,10 +4413,10 @@ STOCK_MOVEMENT_REASONS = {
         "Consumo personal",
 
         "account_code":
-        "5.4.03",
+        "5.1.04",
 
         "account_name":
-        "Consumo personal de productos"
+        "Gastos personales"
     },
 
     "GIFT": {
@@ -4265,10 +4424,10 @@ STOCK_MOVEMENT_REASONS = {
         "Regalo u obsequio",
 
         "account_code":
-        "5.4.04",
+        "5.1.07",
 
         "account_name":
-        "Regalos y obsequios"
+        "Regalos"
     }
 
 }
@@ -5380,7 +5539,7 @@ def purchase_payment_account(
     if payment_method == "Mercado Pago":
 
         return (
-            "1.1.03",
+            "1.1.06",
             "Mercado Pago"
         )
 
@@ -6020,7 +6179,7 @@ def apply_purchase_contents(
             JournalEntry(
                 date=purchase.date,
                 concept=f"Compra {purchase.number}",
-                account_code="5.3.01",
+                account_code="5.1.12",
                 account_name="Materiales y gastos de producción",
                 debit=expense_total,
                 credit=0,
@@ -6407,7 +6566,11 @@ def get_accounts(
     db: Session = Depends(get_db)
 ):
 
-    return db.query(Account).all()
+    return (
+        db.query(Account)
+        .order_by(Account.code.asc())
+        .all()
+    )
     
 @app.post("/accounts")
 def create_account(
@@ -6415,11 +6578,28 @@ def create_account(
     db: Session = Depends(get_db)
 ):
 
+    code = str(data.get("code", "")).strip()
+    name = str(data.get("name", "")).strip()
+
+    if not code or not name:
+        return {"error": "El código y el nombre son obligatorios"}
+
+    if db.query(Account).filter(Account.code == code).first():
+        return {"error": f"Ya existe una cuenta con el código {code}"}
+
+    normalized_name = normalize_account_label(name)
+    for existing in db.query(Account).all():
+        if normalize_account_label(existing.name) == normalized_name:
+            return {
+                "error":
+                f"Ya existe la cuenta {existing.code} - {existing.name}"
+            }
+
     account = Account(
 
-        code=data["code"],
+        code=code,
 
-        name=data["name"],
+        name=name,
 
         type=data["type"],
 
@@ -6613,8 +6793,8 @@ def registrar_asiento_produccion(
             JournalEntry(
                 date=fecha,
                 concept=concepto,
-                account_code="5.2.01",
-                account_name="Gasto de Mano de Obra",
+                account_code="5.1.02",
+                account_name="Mano de obra",
                 debit=costo_mano_obra,
                 credit=0,
                 entry_group=group_id,
