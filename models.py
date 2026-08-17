@@ -395,6 +395,8 @@ class JournalEntry(Base):
 
     credit = Column(Float, default=0)
 
+    entry_number = Column(Integer, index=True)
+
     entry_group = Column(String, index=True)
 
     origin = Column(String, default="MANUAL")

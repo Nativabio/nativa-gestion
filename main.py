@@ -473,6 +473,12 @@ with engine.connect() as conn:
         )
     )
 
+    conn.execute(
+        text(
+            "ALTER TABLE journal_entries "
+            "ADD COLUMN IF NOT EXISTS entry_number INTEGER"
+        )
+    )
 
     conn.execute(
         text(
@@ -538,7 +544,8 @@ with engine.connect() as conn:
             )
             VALUES
                 ('LOT', 0),
-                ('PURCHASE', 0)
+                ('PURCHASE', 0),
+                ('JOURNAL', 0)
             ON CONFLICT (document_type)
             DO NOTHING
             """
@@ -1053,6 +1060,73 @@ def initialize_journal_groups():
 
 
 initialize_journal_groups()
+
+def ensure_journal_entry_numbers(db):
+    row = db.execute(text(
+        "SELECT last_number FROM document_counters WHERE document_type = 'JOURNAL'"
+    )).mappings().first()
+    counter = int(row["last_number"] if row else 0)
+
+    existing = [
+        int(value[0])
+        for value in db.query(JournalEntry.entry_number)
+        .filter(JournalEntry.entry_number.isnot(None))
+        .all()
+        if int(value[0]) > 0
+    ]
+    last_number = max([counter, *existing], default=0)
+
+    groups = db.execute(text(
+        """
+        SELECT entry_group, MIN(date) AS first_date, MIN(id) AS first_id
+        FROM journal_entries
+        WHERE entry_number IS NULL
+        GROUP BY entry_group
+        """
+    )).mappings().all()
+
+    first_migration = (last_number == 0)
+    groups = sorted(
+        groups,
+        key=(
+            (lambda item: (str(item["first_date"] or ""), int(item["first_id"])))
+            if first_migration
+            else (lambda item: int(item["first_id"]))
+        )
+    )
+
+    for group in groups:
+        last_number += 1
+        db.query(JournalEntry).filter(
+            JournalEntry.entry_group == group["entry_group"]
+        ).update(
+            {JournalEntry.entry_number: last_number},
+            synchronize_session=False
+        )
+
+    db.execute(text(
+        """
+        INSERT INTO document_counters (document_type, last_number)
+        VALUES ('JOURNAL', :last_number)
+        ON CONFLICT (document_type) DO UPDATE SET
+        last_number = GREATEST(document_counters.last_number, EXCLUDED.last_number)
+        """
+    ), {"last_number": last_number})
+    db.commit()
+
+
+def initialize_journal_entry_numbers():
+    db = SessionLocal()
+    try:
+        ensure_journal_entry_numbers(db)
+    except Exception as error:
+        db.rollback()
+        print("ERROR INICIALIZANDO NÚMEROS DE ASIENTO:", error)
+    finally:
+        db.close()
+
+
+initialize_journal_entry_numbers()
 
 
 def get_inventory_unit_cost(
@@ -7133,6 +7207,8 @@ def get_journal_entries(
     db: Session = Depends(get_db)
 ):
 
+    ensure_journal_entry_numbers(db)
+
     return (
         db.query(JournalEntry)
         .order_by(
@@ -7227,6 +7303,8 @@ def update_journal_entry_group(
         entries[0].origin_id
     )
 
+    entry_number = entries[0].entry_number
+
     try:
 
         for entry in entries:
@@ -7263,7 +7341,10 @@ def update_journal_entry_group(
                     origin,
 
                     origin_id=
-                    origin_id
+                    origin_id,
+
+                    entry_number=
+                    entry_number
 
                 )
             )
