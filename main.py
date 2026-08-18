@@ -11185,8 +11185,9 @@ def delete_note(
     return {"message": "Nota eliminada correctamente"}
 
 # ================= COTIZADOR WEB PROVEEDORES =================
-# Consulta publica de precios para el modulo Cotizador.
-# No guarda precios en la base de datos.
+# Version corregida: prioriza mejor coincidencia del producto,
+# detecta mejor presentaciones (ml/cc/litro, g/kg)
+# y trata de asociar el precio a la presentacion elegida.
 import json as _sq_json
 import re as _sq_re
 import time as _sq_time
@@ -11203,8 +11204,8 @@ _SQ_PROVIDERS = [
         "base": "https://amizcle.empretienda.com.ar",
         "fallback_paths": [
             "/productos",
-            "/insumos-cosmetica",
             "/aceites-naturales",
+            "/insumos-cosmetica",
             "/insumos-quimicos"
         ]
     },
@@ -11213,7 +11214,8 @@ _SQ_PROVIDERS = [
         "base": "https://ecomarketshop.empretienda.com.ar",
         "fallback_paths": [
             "/productos",
-            "/materias-primas"
+            "/materias-primas",
+            "/cosmetica-artesanal-y-jaboneria"
         ]
     },
     {
@@ -11221,14 +11223,15 @@ _SQ_PROVIDERS = [
         "base": "https://www.psyn.com.ar",
         "fallback_paths": [
             "/productos/",
-            "/aceites-polvos-mantecas-y-ceras/"
+            "/lista-de-productos/"
         ]
     },
     {
         "name": "Ecosmética",
         "base": "https://ecosmetica.net",
         "fallback_paths": [
-            "/productos/"
+            "/productos/",
+            "/product-category/materia-prima/"
         ]
     }
 ]
@@ -11240,7 +11243,13 @@ _SQ_SITE_CACHE_TTL = 21600
 
 _SQ_STOPWORDS = {
     "de", "del", "la", "el", "los", "las", "y", "con", "para",
-    "natural", "cosmetico", "cosmetica", "virgen", "puro", "pura"
+    "natural", "cosmetico", "cosmetica", "virgen", "puro", "pura",
+    "organico", "organica"
+}
+
+_SQ_PRODUCT_TYPES = {
+    "aceite", "manteca", "arcilla", "cera", "hidrolato", "extracto",
+    "esencia", "fragancia", "oleato", "conservante", "vitamina"
 }
 
 _SQ_ALIASES = {
@@ -11250,9 +11259,9 @@ _SQ_ALIASES = {
     "rosa mosqueta": ["rosa mosqueta", "mosqueta"],
     "arbol de te": ["tea tree", "arbol de te"],
     "tea tree": ["tea tree", "arbol de te"],
-    "cera de abejas": ["cera de abejas", "cera amarilla", "cera abeja"],
     "agua de rosas": ["agua de rosas", "hidrolato de rosas", "hidrolato rosas"],
-    "hidrolato de rosas": ["hidrolato de rosas", "agua de rosas", "hidrolato rosas"]
+    "hidrolato de rosas": ["hidrolato de rosas", "agua de rosas", "hidrolato rosas"],
+    "almendras dulces": ["almendras dulces", "almendra dulce"]
 }
 
 
@@ -11283,9 +11292,8 @@ def _sq_query_variants(query):
         if key in normalized:
             variants.extend(values)
 
-    # Si la materia prima lleva palabras administrativas, probamos sin ellas.
     cleaned = _sq_re.sub(
-        r"\b(aceite|manteca|extracto|hidrolato|arcilla|cera)\b",
+        r"\b(aceite|manteca|extracto|hidrolato|arcilla|cera|esencia|fragancia|oleato)\b",
         " ",
         normalized
     )
@@ -11303,10 +11311,10 @@ def _sq_query_variants(query):
             seen.add(item)
             result.append(item)
 
-    return result[:5]
+    return result[:6]
 
 
-def _sq_fetch(url, timeout=9, max_bytes=2_500_000):
+def _sq_fetch(url, timeout=9, max_bytes=3_000_000):
     cache_key = ("fetch", url)
     now = _sq_time.time()
     cached = _SQ_CACHE.get(cache_key)
@@ -11387,13 +11395,11 @@ def _sq_price_number(value):
         return None
 
     if "," in text:
-        # Formato argentino: 6.334,00
         text = text.replace(".", "").replace(",", ".")
     elif text.count(".") > 1:
         text = text.replace(".", "")
     elif "." in text:
         left, right = text.rsplit(".", 1)
-        # 6.334 suele ser miles; 6334.50 decimal.
         if len(right) == 3 and left.replace("-", "").isdigit():
             text = left + right
 
@@ -11470,7 +11476,7 @@ def _sq_offer_price(offers):
     collect(offers)
 
     if candidates:
-        return min(candidates)
+        return max(candidates)
 
     return None
 
@@ -11504,14 +11510,13 @@ def _sq_extract_price(html):
 
     prices = []
 
-    for value in currency_matches[:30]:
+    for value in currency_matches[:50]:
         price = _sq_price_number(value)
         if price is not None and price > 0:
             prices.append(price)
 
     if prices:
-        # En fichas de producto el primer precio suele ser el principal.
-        return prices[0]
+        return max(prices)
 
     return None
 
@@ -11526,105 +11531,39 @@ def _sq_parse_size_number(value):
         return None
 
 
-def _sq_detect_size(title, html, requested_unit=""):
-    requested = _sq_norm(requested_unit)
-    text = _sq_strip_html(html)
+def _sq_convert_size(number_text, unit_text):
+    number = _sq_parse_size_number(number_text)
 
-    # Priorizamos una presentacion marcada explicitamente como seleccionada.
-    explicit_patterns = [
-        r"presentaci[oó]n\s*:?\s*([0-9]+(?:[.,][0-9]+)?)\s*(grs?|gramos?|g|kilos?|kg|ml|mililitros?|litros?|lts?|l)\b",
-        r"presentacion\s*:?\s*([0-9]+(?:[.,][0-9]+)?)\s*(grs?|gramos?|g|kilos?|kg|ml|mililitros?|litros?|lts?|l)\b"
-    ]
-
-    sources = [
-        str(title or ""),
-        text[:12000]
-    ]
-
-    def convert(number_text, unit_text):
-        number = _sq_parse_size_number(number_text)
-
-        if number is None or number <= 0:
-            return None
-
-        unit_norm = _sq_norm(unit_text)
-
-        if unit_norm in {"g", "gr", "grs", "gramo", "gramos"}:
-            return number, "g"
-
-        if unit_norm in {"kg", "kilo", "kilos"}:
-            return number * 1000, "g"
-
-        if unit_norm in {"ml", "mililitro", "mililitros"}:
-            return number, "ml"
-
-        if unit_norm in {"l", "lt", "lts", "litro", "litros"}:
-            return number * 1000, "ml"
-
+    if number is None or number <= 0:
         return None
 
-    for source in sources:
-        for pattern in explicit_patterns:
-            match = _sq_re.search(
-                pattern,
-                source,
-                flags=_sq_re.IGNORECASE
-            )
+    unit_norm = _sq_norm(unit_text)
 
-            if match:
-                converted = convert(
-                    match.group(1),
-                    match.group(2)
-                )
+    if unit_norm in {"g", "gr", "grs", "gramo", "gramos"}:
+        return number, "g"
 
-                if converted:
-                    quantity, unit = converted
+    if unit_norm in {"kg", "kilo", "kilos"}:
+        return number * 1000, "g"
 
-                    if requested.startswith("g") and unit != "g":
-                        continue
-                    if requested.startswith("ml") and unit != "ml":
-                        continue
+    if unit_norm in {"ml", "cc", "c c", "mililitro", "mililitros"}:
+        return number, "ml"
 
-                    return {
-                        "quantity": quantity,
-                        "unit": unit,
-                        "confidence": "high"
-                    }
-
-    # Si no hay presentacion explicita, usamos el titulo.
-    title_patterns = [
-        r"\bx\s*([0-9]+(?:[.,][0-9]+)?)\s*(grs?|gramos?|g|kilos?|kg|ml|mililitros?|litros?|lts?|l)\b",
-        r"\b([0-9]+(?:[.,][0-9]+)?)\s*(grs?|gramos?|g|kilos?|kg|ml|mililitros?|litros?|lts?|l)\b"
-    ]
-
-    for pattern in title_patterns:
-        match = _sq_re.search(
-            pattern,
-            str(title or ""),
-            flags=_sq_re.IGNORECASE
-        )
-
-        if match:
-            converted = convert(
-                match.group(1),
-                match.group(2)
-            )
-
-            if converted:
-                quantity, unit = converted
-
-                if requested.startswith("g") and unit != "g":
-                    continue
-                if requested.startswith("ml") and unit != "ml":
-                    continue
-
-                return {
-                    "quantity": quantity,
-                    "unit": unit,
-                    "confidence": "medium"
-                }
+    if unit_norm in {"l", "lt", "lts", "litro", "litros"}:
+        return number * 1000, "ml"
 
     return None
+
+
+def _sq_query_profile(query):
+    tokens = set(_sq_tokens(query))
+    product_types = {
+        token for token in tokens
+        if token in _SQ_PRODUCT_TYPES
+    }
+    return {
+        "tokens": tokens,
+        "product_types": product_types
+    }
 
 
 def _sq_score_text(text, query):
@@ -11632,28 +11571,46 @@ def _sq_score_text(text, query):
     if not haystack:
         return 0
 
-    best = 0
+    profile = _sq_query_profile(query)
+    tokens = profile["tokens"]
 
-    for variant in _sq_query_variants(query):
-        tokens = _sq_tokens(variant)
+    if not tokens:
+        return 0
 
-        if not tokens:
-            continue
+    score = 0
+    full_query = _sq_norm(query)
 
-        score = 0
+    if full_query and full_query in haystack:
+        score += 40
 
-        if variant and variant in haystack:
-            score += 20
+    matched = 0
 
-        for token in tokens:
-            if token in haystack:
-                score += 5
-            else:
-                score -= 3
+    for token in tokens:
+        if token in haystack:
+            matched += 1
+            score += 8
+        else:
+            score -= 6
 
-        best = max(best, score)
+    # Penaliza un tipo de producto diferente: p.ej. "manteca" cuando buscás "aceite".
+    if profile["product_types"]:
+        found_types = {
+            product_type
+            for product_type in _SQ_PRODUCT_TYPES
+            if product_type in haystack
+        }
+        different = found_types - profile["product_types"]
 
-    return best
+        if different:
+            score -= 24 * len(different)
+
+    # Bonifica si casi todos los tokens están presentes.
+    if matched == len(tokens):
+        score += 20
+    elif matched >= max(1, len(tokens) - 1):
+        score += 8
+
+    return score
 
 
 def _sq_extract_links(html, current_url, provider, query):
@@ -11699,7 +11656,7 @@ def _sq_extract_links(html, current_url, provider, query):
             "text": text
         })
 
-        if len(result) >= 20:
+        if len(result) >= 25:
             break
 
     return result
@@ -11761,7 +11718,7 @@ def _sq_site_urls(provider):
     all_urls = []
     queue = sitemap_candidates[:]
 
-    while queue and len(seen_maps) < 10:
+    while queue and len(seen_maps) < 12:
         sitemap_url = queue.pop(0)
 
         if sitemap_url in seen_maps:
@@ -11778,14 +11735,11 @@ def _sq_site_urls(provider):
         except Exception:
             continue
 
-        urls, children = _sq_parse_sitemap(
-            xml_text,
-            provider
-        )
+        urls, children = _sq_parse_sitemap(xml_text, provider)
         all_urls.extend(urls)
 
         for child in children:
-            if child not in seen_maps and len(queue) < 20:
+            if child not in seen_maps and len(queue) < 30:
                 queue.append(child)
 
     unique = []
@@ -11824,8 +11778,8 @@ def _sq_candidate_urls(provider, query):
         reverse=True
     )
 
-    if candidates and candidates[0]["score"] >= 10:
-        return candidates[:12]
+    if candidates and candidates[0]["score"] >= 18:
+        return candidates[:20]
 
     base = provider["base"].rstrip("/")
     encoded = _sq_quote(query)
@@ -11843,7 +11797,7 @@ def _sq_candidate_urls(provider, query):
 
     seen_search = set()
 
-    for search_url in search_urls[:6]:
+    for search_url in search_urls[:8]:
         if search_url in seen_search:
             continue
 
@@ -11885,7 +11839,251 @@ def _sq_candidate_urls(provider, query):
         key=lambda item: item["score"],
         reverse=True
     )
-    return result[:12]
+    return result[:20]
+
+
+def _sq_collect_size_candidates(title, html, requested_unit):
+    requested = _sq_norm(requested_unit)
+    raw_html = html or ""
+    clean_text = _sq_strip_html(raw_html)
+    candidates = []
+
+    def add_candidate(number_text, unit_text, source, confidence):
+        converted = _sq_convert_size(number_text, unit_text)
+
+        if not converted:
+            return
+
+        quantity, unit = converted
+
+        if requested.startswith("g") and unit != "g":
+            return
+        if requested.startswith("ml") and unit != "ml":
+            return
+
+        candidates.append({
+            "quantity": quantity,
+            "unit": unit,
+            "source": source,
+            "confidence": confidence
+        })
+
+    # 1) Presentacion explicitamente informada.
+    for match in _sq_re.finditer(
+        r"(?i)presentaci[oó]n\s*:?\s*([0-9]+(?:[.,][0-9]+)?)\s*(cc|ml|mililitros?|l|litros?|g|grs?|gramos?|kg|kilos?)",
+        clean_text
+    ):
+        add_candidate(match.group(1), match.group(2), "presentacion", 100)
+
+    # 2) Option selected en un select.
+    for match in _sq_re.finditer(
+        r'(?is)<option[^>]*selected[^>]*>([^<]+)</option>',
+        raw_html
+    ):
+        text = _sq_strip_html(match.group(1))
+        size_match = _sq_re.search(
+            r"([0-9]+(?:[.,][0-9]+)?)\s*(cc|ml|mililitros?|l|litros?|g|grs?|gramos?|kg|kilos?)",
+            text,
+            flags=_sq_re.IGNORECASE
+        )
+        if size_match:
+            add_candidate(size_match.group(1), size_match.group(2), "selected_option", 95)
+
+    # 3) Botones/elementos activos o seleccionados.
+    for match in _sq_re.finditer(
+        r'(?is)<[^>]+class=["\'][^"\']*(?:active|selected|current|checked)[^"\']*["\'][^>]*>(.*?)</[^>]+>',
+        raw_html
+    ):
+        text = _sq_strip_html(match.group(1))
+        size_match = _sq_re.search(
+            r"([0-9]+(?:[.,][0-9]+)?)\s*(cc|ml|mililitros?|l|litros?|g|grs?|gramos?|kg|kilos?)",
+            text,
+            flags=_sq_re.IGNORECASE
+        )
+        if size_match:
+            add_candidate(size_match.group(1), size_match.group(2), "active_button", 90)
+
+    # 4) Titulo del producto.
+    for match in _sq_re.finditer(
+        r"(?i)([0-9]+(?:[.,][0-9]+)?)\s*(cc|ml|mililitros?|l|litros?|g|grs?|gramos?|kg|kilos?)",
+        str(title or "")
+    ):
+        add_candidate(match.group(1), match.group(2), "title", 80)
+
+    # 5) Otras ocurrencias de presentaciones dentro del HTML/texto.
+    for match in _sq_re.finditer(
+        r"(?i)\b([0-9]+(?:[.,][0-9]+)?)\s*(cc|ml|mililitros?|l|litros?|g|grs?|gramos?|kg|kilos?)\b",
+        clean_text
+    ):
+        add_candidate(match.group(1), match.group(2), "text", 40)
+
+    # Unicas.
+    seen = set()
+    result = []
+
+    for item in candidates:
+        key = (item["quantity"], item["unit"], item["source"])
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+
+    return result[:50]
+
+
+def _sq_choose_size(candidates, requested_unit, desired_quantity):
+    if not candidates:
+        return None
+
+    requested = _sq_norm(requested_unit)
+    target = desired_quantity if desired_quantity and desired_quantity > 0 else None
+
+    if target is None and requested in {"ml", "g"}:
+        target = 250
+
+    best = None
+    best_score = -10**9
+
+    for item in candidates:
+        score = item["confidence"]
+
+        if requested.startswith("g") and item["unit"] == "g":
+            score += 10
+        if requested.startswith("ml") and item["unit"] == "ml":
+            score += 10
+
+        if target is not None:
+            delta = abs(item["quantity"] - target)
+            if delta == 0:
+                score += 60
+            else:
+                score += max(0, 35 - (delta / max(target, 1)) * 40)
+
+        # Preferencia secundaria: presentaciones medianas.
+        if target is None:
+            if requested == "ml" and 100 <= item["quantity"] <= 500:
+                score += 10
+            if requested == "g" and 100 <= item["quantity"] <= 500:
+                score += 10
+
+        if best is None or score > best_score:
+            best = dict(item)
+            best_score = score
+
+    if best:
+        best["selection_score"] = best_score
+
+    return best
+
+
+def _sq_size_patterns(size):
+    if not size:
+        return []
+
+    quantity = size["quantity"]
+    unit = size["unit"]
+
+    texts = set()
+
+    def num_texts(number):
+        base = int(number) if float(number).is_integer() else number
+        values = {
+            str(base),
+            str(base).replace(".", ","),
+            str(base).replace(".", "")
+        }
+        return [value for value in values if value]
+
+    if unit == "ml":
+        for value in num_texts(quantity):
+            texts.update({
+                rf"{value}\s*ml",
+                rf"{value}\s*cc",
+            })
+
+        if quantity % 1000 == 0:
+            liters = quantity / 1000
+            for value in num_texts(liters):
+                texts.update({
+                    rf"{value}\s*l\b",
+                    rf"{value}\s*lt\b",
+                    rf"{value}\s*litr(?:o|os)\b",
+                })
+
+    if unit == "g":
+        for value in num_texts(quantity):
+            texts.update({
+                rf"{value}\s*g\b",
+                rf"{value}\s*grs?\b",
+                rf"{value}\s*gram(?:o|os)\b",
+            })
+
+        if quantity % 1000 == 0:
+            kilos = quantity / 1000
+            for value in num_texts(kilos):
+                texts.update({
+                    rf"{value}\s*kg\b",
+                    rf"{value}\s*kilos?\b",
+                })
+
+    return list(texts)
+
+
+def _sq_prices_from_snippet(snippet):
+    prices = []
+
+    for match in _sq_re.finditer(
+        r"\$\s*([0-9][0-9.\s]*(?:,[0-9]{1,2})?)",
+        snippet
+    ):
+        number = _sq_price_number(match.group(1))
+        if number is not None and number > 0:
+            prices.append(number)
+
+    for match in _sq_re.finditer(
+        r'(?i)"price"\s*:\s*"?(\\d[\\d.,]*)"?',
+        snippet
+    ):
+        number = _sq_price_number(match.group(1))
+        if number is not None and number > 0:
+            prices.append(number)
+
+    for match in _sq_re.finditer(
+        r"(?i)price\s*[:=]\s*'?([0-9][0-9.,]*)'?",
+        snippet
+    ):
+        number = _sq_price_number(match.group(1))
+        if number is not None and number > 0:
+            prices.append(number)
+
+    return prices
+
+
+def _sq_extract_price_for_size(html, size):
+    if not html or not size:
+        return None
+
+    raw_html = html
+    candidates = []
+
+    for pattern in _sq_size_patterns(size):
+        for match in _sq_re.finditer(
+            pattern,
+            raw_html,
+            flags=_sq_re.IGNORECASE
+        ):
+            start = max(0, match.start() - 600)
+            end = min(len(raw_html), match.end() + 1000)
+            snippet = raw_html[start:end]
+            prices = _sq_prices_from_snippet(snippet)
+
+            if prices:
+                candidates.extend(prices)
+
+    if candidates:
+        # Si hay precio de lista y precio con descuento, usamos el mayor.
+        return max(candidates)
+
+    return None
 
 
 def _sq_provider_quote(provider, query, requested_unit, desired_quantity):
@@ -11906,7 +12104,7 @@ def _sq_provider_quote(provider, query, requested_unit, desired_quantity):
 
         best = None
 
-        for candidate in candidates[:4]:
+        for candidate in candidates[:8]:
             try:
                 html = _sq_fetch(
                     candidate["url"],
@@ -11916,25 +12114,34 @@ def _sq_provider_quote(provider, query, requested_unit, desired_quantity):
                 continue
 
             title = _sq_extract_title(html)
-            page_score = max(
-                _sq_score_text(title, query),
-                _sq_score_text(candidate["url"], query)
-            )
+            title_score = _sq_score_text(title, query)
+            url_score = _sq_score_text(candidate["url"], query)
+            page_score = max(title_score, url_score)
 
-            # Evitamos confundir productos poco relacionados.
             if page_score <= 0:
                 continue
 
-            price = _sq_extract_price(html)
-
-            if price is None or price <= 0:
-                continue
-
-            size = _sq_detect_size(
+            size_candidates = _sq_collect_size_candidates(
                 title,
                 html,
                 requested_unit
             )
+            chosen_size = _sq_choose_size(
+                size_candidates,
+                requested_unit,
+                desired_quantity
+            )
+
+            price = _sq_extract_price_for_size(
+                html,
+                chosen_size
+            ) if chosen_size else None
+
+            if price is None or price <= 0:
+                price = _sq_extract_price(html)
+
+            if price is None or price <= 0:
+                continue
 
             row = {
                 "provider": provider["name"],
@@ -11944,23 +12151,24 @@ def _sq_provider_quote(provider, query, requested_unit, desired_quantity):
                 "store_url": provider["base"],
                 "price": price,
                 "presentation_quantity":
-                    size["quantity"] if size else None,
+                    chosen_size["quantity"] if chosen_size else None,
                 "presentation_unit":
-                    size["unit"] if size else "",
+                    chosen_size["unit"] if chosen_size else "",
                 "presentation_confidence":
-                    size["confidence"] if size else "none",
+                    chosen_size["confidence"] if chosen_size else "none",
                 "normalized_cost": None,
                 "estimated_cost": None,
-                "score": page_score,
+                "score": page_score + (
+                    chosen_size.get("selection_score", 0)
+                    if chosen_size else -20
+                ),
                 "message":
-                    "" if size
+                    "" if chosen_size
                     else "Precio encontrado, pero no pude detectar con seguridad la presentación."
             }
 
-            if size and size["quantity"] > 0:
-                unit_cost = price / size["quantity"]
-
-                # Costo normalizado por 100 g / 100 ml.
+            if chosen_size and chosen_size["quantity"] > 0:
+                unit_cost = price / chosen_size["quantity"]
                 row["normalized_cost"] = unit_cost * 100
 
                 if desired_quantity and desired_quantity > 0:
@@ -11971,11 +12179,8 @@ def _sq_provider_quote(provider, query, requested_unit, desired_quantity):
             if best is None or row["score"] > best["score"]:
                 best = row
 
-            # Una coincidencia clara ya es suficiente.
-            if page_score >= 20 and size:
-                break
-
         if best:
+            best.pop("score", None)
             return best
 
         return {
@@ -12054,7 +12259,6 @@ def supplier_web_quotes(
         row["rank"] = rank_by_provider.get(
             row.get("provider")
         )
-        row.pop("score", None)
 
     return {
         "query": material,
@@ -12065,7 +12269,7 @@ def supplier_web_quotes(
         "price_notes": [
             "Son precios publicados en la web al momento de la consulta.",
             "No incluyen envío.",
-            "No se aplican descuentos por efectivo, transferencia, mayorista o cupones.",
+            "Si informás una cantidad, Nativa intenta priorizar la presentación más cercana a esa cantidad.",
             "Si la presentación no puede detectarse con seguridad, el proveedor no entra al ranking."
         ],
         "results": results
