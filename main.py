@@ -11185,48 +11185,55 @@ def delete_note(
     return {"message": "Nota eliminada correctamente"}
 
 # ================= COTIZADOR WEB PROVEEDORES =================
-# Version 4: fuentes confirmadas por materia prima + proveedor + presentación.
-# ml y cc se normalizan como la misma unidad.
+# Version 5: mejor precio unitario por proveedor.
+# No requiere configurar fuentes.
+# Busca varias presentaciones y compara por $/g o $/ml.
 import json as _sq_json
 import re as _sq_re
 import time as _sq_time
 import unicodedata as _sq_unicodedata
 import xml.etree.ElementTree as _sq_et
-from datetime import datetime as _sq_datetime
+from concurrent.futures import ThreadPoolExecutor as _sq_ThreadPoolExecutor
 from html import unescape as _sq_unescape
 from urllib.parse import quote as _sq_quote, urljoin as _sq_urljoin, urlparse as _sq_urlparse
 from urllib.request import Request as _sq_Request, urlopen as _sq_urlopen
-from sqlalchemy import text as _sq_text
 
 _SQ_PROVIDERS = [
     {
         "name": "Amizcle",
         "base": "https://amizcle.empretienda.com.ar",
+        "kind": "empretienda",
         "fallback_paths": [
             "/productos",
             "/aceites-naturales",
-            "/insumos-cosmetica"
+            "/insumos-cosmetica",
+            "/insumos-cosmetica/mantecas"
         ]
     },
     {
         "name": "Ecomarketshop",
         "base": "https://ecomarketshop.empretienda.com.ar",
+        "kind": "empretienda",
         "fallback_paths": [
             "/productos",
-            "/materias-primas"
+            "/materias-primas",
+            "/cosmetica-artesanal-y-jaboneria"
         ]
     },
     {
         "name": "Parvati",
         "base": "https://www.psyn.com.ar",
+        "kind": "parvati",
         "fallback_paths": [
-            "/productos/",
-            "/aceites-polvos-mantecas-y-ceras/aceites1/"
+            "/aceites-polvos-mantecas-y-ceras/",
+            "/aceites-polvos-mantecas-y-ceras/aceites1/",
+            "/aceites-polvos-mantecas-y-ceras/mantecas-y-ceras1/mantecas-y-ceras/"
         ]
     },
     {
         "name": "Ecosmética",
         "base": "https://ecosmetica.net",
+        "kind": "ecosmetica",
         "fallback_paths": [
             "/productos/",
             "/insumos-cosmetica-natural-capilar/aceites-vegetales2/"
@@ -11235,77 +11242,89 @@ _SQ_PROVIDERS = [
 ]
 
 _SQ_CACHE = {}
-_SQ_SITEMAP_CACHE = {}
-_SQ_CACHE_TTL = 600
-_SQ_SITEMAP_TTL = 21600
+_SQ_SITE_URLS_CACHE = {}
+_SQ_CACHE_TTL = 300
+_SQ_SITE_CACHE_TTL = 21600
 
+_SQ_STOPWORDS = {
+    "de", "del", "la", "el", "los", "las", "y", "con", "para",
+    "natural", "cosmetico", "cosmetica", "virgen", "puro", "pura",
+    "organico", "organica"
+}
 
-def _sq_provider(name):
-    wanted = str(name or "").strip().lower()
+_SQ_PRODUCT_TYPES = {
+    "aceite", "manteca", "arcilla", "cera", "hidrolato", "extracto",
+    "esencia", "fragancia", "oleato", "conservante", "vitamina",
+    "oxido", "acido", "alcohol"
+}
 
-    for provider in _SQ_PROVIDERS:
-        if provider["name"].lower() == wanted:
-            return provider
-
-    return None
+_SQ_ALIASES = {
+    "vit e": ["vitamina e", "tocoferol"],
+    "vitamina e": ["vitamina e", "tocoferol"],
+    "karite": ["karite", "shea"],
+    "rosa mosqueta": ["rosa mosqueta", "mosqueta"],
+    "arbol de te": ["tea tree", "arbol de te"],
+    "tea tree": ["tea tree", "arbol de te"],
+    "agua de rosas": ["agua de rosas", "hidrolato de rosas", "hidrolato rosas"],
+    "hidrolato de rosas": ["hidrolato de rosas", "agua de rosas", "hidrolato rosas"],
+    "almendras dulces": ["almendras dulces", "almendra dulce", "almendras"],
+    "almendras": ["almendras", "almendras dulces", "almendra dulce"],
+    "cacao": ["cacao"]
+}
 
 
 def _sq_norm(value):
     text = str(value or "").strip().lower()
     text = _sq_unicodedata.normalize("NFD", text)
     text = "".join(
-        char
-        for char in text
+        char for char in text
         if _sq_unicodedata.category(char) != "Mn"
     )
     text = _sq_re.sub(r"[^a-z0-9]+", " ", text)
     return _sq_re.sub(r"\s+", " ", text).strip()
 
 
-def _sq_unit(value):
-    text = _sq_norm(value)
-
-    if text in {"ml", "cc"} or "mililit" in text:
-        return "ml"
-
-    if text in {"g", "gr", "grs"} or "gram" in text:
-        return "g"
-
-    if text in {"kg", "kilo", "kilos"}:
-        return "g"
-
-    if text in {"l", "lt", "lts", "litro", "litros"}:
-        return "ml"
-
-    return text or "unidad"
+def _sq_tokens(value):
+    return [
+        token
+        for token in _sq_norm(value).split()
+        if token and token not in _SQ_STOPWORDS
+    ]
 
 
-def _sq_quantity(value):
-    try:
-        number = float(value or 0)
-    except Exception:
-        return 0.0
+def _sq_query_variants(query):
+    normalized = _sq_norm(query)
+    values = [normalized]
 
-    return max(number, 0.0)
+    for key, aliases in _SQ_ALIASES.items():
+        if key in normalized:
+            values.extend(aliases)
 
-
-def _sq_same_quantity(a, b):
-    return abs(_sq_quantity(a) - _sq_quantity(b)) < 0.0001
-
-
-def _sq_host(url):
-    return (_sq_urlparse(str(url or "")).hostname or "").lower()
-
-
-def _sq_safe_provider_url(provider, url):
-    return (
-        str(url or "").startswith(("http://", "https://"))
-        and _sq_host(url) == _sq_host(provider["base"])
+    # Variante sin el tipo de producto para URLs cortas.
+    cleaned = _sq_re.sub(
+        r"\b(aceite|manteca|arcilla|cera|hidrolato|extracto|esencia|fragancia|oleato)\b",
+        " ",
+        normalized
     )
+    cleaned = _sq_re.sub(r"\s+", " ", cleaned).strip()
+
+    if cleaned:
+        values.append(cleaned)
+
+    result = []
+    seen = set()
+
+    for value in values:
+        value = _sq_norm(value)
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+
+    return result[:6]
 
 
-def _sq_fetch(url, timeout=10, max_bytes=4_000_000):
-    key = str(url)
+def _sq_fetch(url, timeout=10, max_bytes=5_000_000):
+    key = ("fetch", url)
     now = _sq_time.time()
     cached = _SQ_CACHE.get(key)
 
@@ -11313,66 +11332,58 @@ def _sq_fetch(url, timeout=10, max_bytes=4_000_000):
         return cached["value"]
 
     request = _sq_Request(
-        key,
+        url,
         headers={
             "User-Agent":
-                "Mozilla/5.0 (compatible; NativaGestion/1.0)",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125 Safari/537.36",
             "Accept":
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language":
-                "es-AR,es;q=0.9,en;q=0.6"
+            "Accept-Language": "es-AR,es;q=0.9,en;q=0.5",
+            "Cache-Control": "no-cache"
         }
     )
 
     with _sq_urlopen(request, timeout=timeout) as response:
         data = response.read(max_bytes)
 
-    value = data.decode("utf-8", errors="ignore")
-    _SQ_CACHE[key] = {
-        "time": now,
-        "value": value
-    }
+    text = data.decode("utf-8", errors="ignore")
+    _SQ_CACHE[key] = {"time": now, "value": text}
+    return text
 
-    return value
+
+def _sq_host(url):
+    return (_sq_urlparse(url).hostname or "").lower()
+
+
+def _sq_same_host(url, base):
+    return _sq_host(url) == _sq_host(base)
 
 
 def _sq_strip_html(html):
+    if not html:
+        return ""
+
     text = _sq_re.sub(
         r"(?is)<(script|style|svg).*?>.*?</\1>",
         " ",
-        html or ""
+        html
     )
-    text = _sq_re.sub(
-        r"(?s)<[^>]+>",
-        " ",
-        text
-    )
+    text = _sq_re.sub(r"(?s)<[^>]+>", " ", text)
     text = _sq_unescape(text)
-    return _sq_re.sub(
-        r"\s+",
-        " ",
-        text
-    ).strip()
+    return _sq_re.sub(r"\s+", " ", text).strip()
 
 
 def _sq_extract_title(html):
-    patterns = [
+    for pattern in [
         r'(?is)<h1[^>]*>(.*?)</h1>',
         r'(?is)<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
         r'(?is)<title[^>]*>(.*?)</title>'
-    ]
-
-    for pattern in patterns:
-        match = _sq_re.search(
-            pattern,
-            html or ""
-        )
-
+    ]:
+        match = _sq_re.search(pattern, html or "")
         if match:
-            value = _sq_strip_html(
-                match.group(1)
-            )
-
+            value = _sq_strip_html(match.group(1))
             if value:
                 return value
 
@@ -11384,30 +11395,20 @@ def _sq_price_number(value):
         return None
 
     text = str(value).strip()
-    text = _sq_re.sub(
-        r"[^\d,.\-]",
-        "",
-        text
-    )
+    text = _sq_re.sub(r"[^\d,.\-]", "", text)
 
     if not text:
         return None
 
     if "," in text:
-        text = (
-            text
-            .replace(".", "")
-            .replace(",", ".")
-        )
+        text = text.replace(".", "").replace(",", ".")
     elif text.count(".") > 1:
         text = text.replace(".", "")
     elif "." in text:
         left, right = text.rsplit(".", 1)
 
-        if (
-            len(right) == 3
-            and left.replace("-", "").isdigit()
-        ):
+        # En Argentina 10.968 suele significar diez mil novecientos sesenta y ocho.
+        if len(right) == 3 and left.replace("-", "").isdigit():
             text = left + right
 
     try:
@@ -11426,6 +11427,8 @@ def _sq_convert_size(number_text, unit_text):
         number = float(
             str(number_text)
             .strip()
+            .replace(" ", "")
+            .replace(".", "")
             .replace(",", ".")
         )
     except Exception:
@@ -11436,37 +11439,16 @@ def _sq_convert_size(number_text, unit_text):
 
     unit = _sq_norm(unit_text)
 
-    if unit in {
-        "g",
-        "gr",
-        "grs",
-        "gramo",
-        "gramos"
-    }:
+    if unit in {"g", "gr", "grs", "gramo", "gramos"}:
         return number, "g"
 
-    if unit in {
-        "kg",
-        "kilo",
-        "kilos"
-    }:
+    if unit in {"kg", "kilo", "kilos"}:
         return number * 1000, "g"
 
-    if unit in {
-        "ml",
-        "cc",
-        "mililitro",
-        "mililitros"
-    }:
+    if unit in {"ml", "cc", "mililitro", "mililitros"}:
         return number, "ml"
 
-    if unit in {
-        "l",
-        "lt",
-        "lts",
-        "litro",
-        "litros"
-    }:
+    if unit in {"l", "lt", "lts", "litro", "litros"}:
         return number * 1000, "ml"
 
     return None
@@ -11475,8 +11457,7 @@ def _sq_convert_size(number_text, unit_text):
 def _sq_find_size(text):
     match = _sq_re.search(
         r"(?i)\b([0-9]+(?:[.,][0-9]+)?)\s*"
-        r"(cc|ml|mililitros?|l|litros?|lts?|"
-        r"g|grs?|gramos?|kg|kilos?)\b",
+        r"(cc|ml|mililitros?|l|lt|lts|litros?|g|gr|grs|gramos?|kg|kilo|kilos)\b",
         str(text or "")
     )
 
@@ -11492,457 +11473,145 @@ def _sq_find_size(text):
         return None
 
     return {
-        "quantity":
-            converted[0],
-        "unit":
-            converted[1]
+        "quantity": converted[0],
+        "unit": converted[1],
+        "raw": match.group(0)
     }
 
 
-def _sq_main_price(html):
-    # Precio estructurado cuando la página representa una sola presentación.
-    blocks = _sq_re.findall(
-        r'(?is)<script[^>]+type=["\']application/ld\+json["\'][^>]*>'
-        r'(.*?)</script>',
-        html or ""
-    )
+def _sq_query_profile(query):
+    tokens = set(_sq_tokens(query))
 
-    for block in blocks:
-        try:
-            data = _sq_json.loads(
-                block.strip()
-            )
-        except Exception:
-            continue
-
-        stack = [data]
-
-        while stack:
-            value = stack.pop()
-
-            if isinstance(value, dict):
-                value_type = str(
-                    value.get("@type", "")
-                ).lower()
-
-                if value_type == "product":
-                    offers = value.get("offers")
-
-                    if isinstance(offers, dict):
-                        price = _sq_price_number(
-                            offers.get("price")
-                        )
-
-                        if price:
-                            return price
-
-                    if isinstance(offers, list):
-                        # Solo usamos un listado si todos los precios son iguales.
-                        prices = []
-
-                        for offer in offers:
-                            if not isinstance(
-                                offer,
-                                dict
-                            ):
-                                continue
-
-                            price = _sq_price_number(
-                                offer.get("price")
-                            )
-
-                            if price:
-                                prices.append(price)
-
-                        if (
-                            prices
-                            and max(prices) - min(prices) < 0.01
-                        ):
-                            return prices[0]
-
-                stack.extend(
-                    value.values()
-                )
-
-            elif isinstance(value, list):
-                stack.extend(value)
-
-    # Precio visible principal.
-    text = _sq_strip_html(
-        html
-    )
-
-    match = _sq_re.search(
-        r"\$\s*([0-9][0-9.\s]*(?:,[0-9]{1,2})?)",
-        text
-    )
-
-    if match:
-        return _sq_price_number(
-            match.group(1)
-        )
-
-    return None
-
-
-def _sq_target_patterns(
-    quantity,
-    unit
-):
-    quantity = _sq_quantity(
-        quantity
-    )
-    unit = _sq_unit(unit)
-
-    if quantity <= 0:
-        return []
-
-    if float(quantity).is_integer():
-        number = str(
-            int(quantity)
-        )
-    else:
-        number = str(
-            quantity
-        ).replace(".", "[.,]")
-
-    patterns = []
-
-    if unit == "ml":
-        patterns.extend([
-            rf"\b{number}\s*ml\b",
-            rf"\b{number}\s*cc\b",
-            rf"\b{number}\s*mililitros?\b"
-        ])
-
-        if (
-            float(quantity).is_integer()
-            and int(quantity) % 1000 == 0
-        ):
-            liters = int(quantity) // 1000
-            patterns.extend([
-                rf"\b{liters}\s*l\b",
-                rf"\b{liters}\s*lt\b",
-                rf"\b{liters}\s*litros?\b"
-            ])
-
-    elif unit == "g":
-        patterns.extend([
-            rf"\b{number}\s*g\b",
-            rf"\b{number}\s*grs?\b",
-            rf"\b{number}\s*gramos?\b"
-        ])
-
-        if (
-            float(quantity).is_integer()
-            and int(quantity) % 1000 == 0
-        ):
-            kilos = int(quantity) // 1000
-            patterns.extend([
-                rf"\b{kilos}\s*kg\b",
-                rf"\b{kilos}\s*kilos?\b"
-            ])
-
-    return patterns
-
-
-def _sq_prices_near_target(
-    html,
-    quantity,
-    unit
-):
-    prices = []
-
-    price_patterns = [
-        r'(?i)["\'](?:price|precio|regular_price|list_price|amount|final_price)["\']'
-        r'\s*:\s*["\']?\$?\s*([0-9][0-9.,]*)',
-        r'(?i)(?:data-price|data-precio)=["\']\$?\s*([0-9][0-9.,]*)["\']'
-    ]
-
-    for size_pattern in _sq_target_patterns(
-        quantity,
-        unit
-    ):
-        for match in _sq_re.finditer(
-            size_pattern,
-            html or "",
-            flags=_sq_re.IGNORECASE
-        ):
-            start = max(
-                0,
-                match.start() - 900
-            )
-            end = min(
-                len(html),
-                match.end() + 1200
-            )
-            snippet = html[
-                start:end
-            ]
-
-            for pattern in price_patterns:
-                for price_match in _sq_re.finditer(
-                    pattern,
-                    snippet
-                ):
-                    price = _sq_price_number(
-                        price_match.group(1)
-                    )
-
-                    if price:
-                        prices.append(price)
-
-    # No elegimos "el menor" de toda la página. Solo aceptamos
-    # si alrededor de la variante aparece un único precio razonable.
-    unique = []
-
-    for price in prices:
-        if not any(
-            abs(price - existing) < 0.01
-            for existing in unique
-        ):
-            unique.append(price)
-
-    if len(unique) == 1:
-        return unique[0]
-
-    return None
-
-
-def _sq_detect_exact_page_price(
-    html,
-    title,
-    target_quantity,
-    target_unit
-):
-    title_size = _sq_find_size(
-        title
-    )
-
-    if (
-        title_size
-        and _sq_same_quantity(
-            title_size["quantity"],
-            target_quantity
-        )
-        and title_size["unit"] == _sq_unit(
-            target_unit
-        )
-    ):
-        price = _sq_main_price(
-            html
-        )
-
-        if price:
-            return price
-
-    # Algunas fichas indican explícitamente la presentación seleccionada.
-    text = _sq_strip_html(
-        html
-    )
-
-    for pattern in [
-        r"(?i)presentaci[oó]n\s*:?\s*"
-        r"([0-9]+(?:[.,][0-9]+)?)\s*"
-        r"(cc|ml|mililitros?|l|litros?|"
-        r"g|grs?|gramos?|kg|kilos?)",
-        r"(?i)cantidad\s*:?\s*"
-        r"([0-9]+(?:[.,][0-9]+)?)\s*"
-        r"(cc|ml|mililitros?|l|litros?|"
-        r"g|grs?|gramos?|kg|kilos?)"
-    ]:
-        match = _sq_re.search(
-            pattern,
-            text
-        )
-
-        if not match:
-            continue
-
-        converted = _sq_convert_size(
-            match.group(1),
-            match.group(2)
-        )
-
-        if not converted:
-            continue
-
-        quantity, unit = converted
-
-        if (
-            _sq_same_quantity(
-                quantity,
-                target_quantity
-            )
-            and unit == _sq_unit(
-                target_unit
-            )
-        ):
-            price = _sq_main_price(
-                html
-            )
-
-            if price:
-                return price
-
-    # Último intento: datos internos de la variante cerca del tamaño.
-    return _sq_prices_near_target(
-        html,
-        target_quantity,
-        target_unit
-    )
-
-
-def _sq_ensure_sources_table(db):
-    db.execute(
-        _sq_text(
-            """
-            CREATE TABLE IF NOT EXISTS supplier_quote_sources (
-                raw_material_id INTEGER NOT NULL,
-                provider VARCHAR(80) NOT NULL,
-                target_quantity DOUBLE PRECISION NOT NULL,
-                target_unit VARCHAR(20) NOT NULL,
-                product_url TEXT NOT NULL,
-                product_name TEXT,
-                manual_price DOUBLE PRECISION,
-                updated_at VARCHAR(40),
-                PRIMARY KEY (
-                    raw_material_id,
-                    provider,
-                    target_quantity,
-                    target_unit
-                )
-            )
-            """
-        )
-    )
-    db.commit()
-
-
-def _sq_source_row(
-    db,
-    raw_material_id,
-    provider,
-    quantity,
-    unit
-):
-    _sq_ensure_sources_table(
-        db
-    )
-
-    return db.execute(
-        _sq_text(
-            """
-            SELECT
-                raw_material_id,
-                provider,
-                target_quantity,
-                target_unit,
-                product_url,
-                product_name,
-                manual_price,
-                updated_at
-            FROM supplier_quote_sources
-            WHERE raw_material_id = :raw_material_id
-              AND provider = :provider
-              AND ABS(target_quantity - :quantity) < 0.0001
-              AND target_unit = :unit
-            LIMIT 1
-            """
-        ),
-        {
-            "raw_material_id":
-                int(raw_material_id),
-            "provider":
-                provider,
-            "quantity":
-                _sq_quantity(quantity),
-            "unit":
-                _sq_unit(unit)
+    return {
+        "tokens": tokens,
+        "types": {
+            token
+            for token in tokens
+            if token in _SQ_PRODUCT_TYPES
+        },
+        "core": {
+            token
+            for token in tokens
+            if token not in _SQ_PRODUCT_TYPES
         }
-    ).mappings().first()
+    }
 
 
-def _sq_parse_sitemap(
-    xml_text,
-    provider
-):
+def _sq_title_acceptable(title, query):
+    haystack = _sq_norm(title)
+    profile = _sq_query_profile(query)
+
+    if not haystack:
+        return False
+
+    if profile["core"]:
+        matched = {
+            token
+            for token in profile["core"]
+            if token in haystack
+        }
+
+        # Para nombres cortos exigimos que coincidan las palabras de identidad.
+        if len(profile["core"]) <= 2:
+            if matched != profile["core"]:
+                # Aceptar alias conocidos.
+                alias_ok = False
+                for variant in _sq_query_variants(query):
+                    variant_core = {
+                        token
+                        for token in _sq_tokens(variant)
+                        if token not in _SQ_PRODUCT_TYPES
+                    }
+                    if variant_core and all(
+                        token in haystack
+                        for token in variant_core
+                    ):
+                        alias_ok = True
+                        break
+
+                if not alias_ok:
+                    return False
+        elif len(matched) < max(1, len(profile["core"]) - 1):
+            return False
+
+    if profile["types"]:
+        if not any(
+            product_type in haystack
+            for product_type in profile["types"]
+        ):
+            return False
+
+        wrong_types = {
+            product_type
+            for product_type in _SQ_PRODUCT_TYPES
+            if product_type in haystack
+            and product_type not in profile["types"]
+        }
+
+        if wrong_types:
+            return False
+
+    return True
+
+
+def _sq_score_text(text, query):
+    haystack = _sq_norm(text)
+
+    if not haystack:
+        return -999
+
+    score = 0
+    normalized_query = _sq_norm(query)
+
+    if normalized_query and normalized_query in haystack:
+        score += 50
+
+    for token in _sq_tokens(query):
+        if token in haystack:
+            score += 10
+        else:
+            score -= 7
+
+    return score
+
+
+def _sq_parse_sitemap(xml_text, provider):
     urls = []
     children = []
 
     try:
-        root = _sq_et.fromstring(
-            xml_text
-        )
+        root = _sq_et.fromstring(xml_text)
     except Exception:
         return urls, children
 
     tag = root.tag.lower()
 
-    if tag.endswith(
-        "sitemapindex"
-    ):
-        for loc in root.findall(
-            ".//{*}loc"
-        ):
-            value = (
-                loc.text or ""
-            ).strip()
+    if tag.endswith("sitemapindex"):
+        for loc in root.findall(".//{*}loc"):
+            value = (loc.text or "").strip()
 
-            if (
-                value
-                and _sq_safe_provider_url(
-                    provider,
-                    value
-                )
-            ):
-                children.append(
-                    value
-                )
+            if value and _sq_same_host(value, provider["base"]):
+                children.append(value)
 
-    elif tag.endswith(
-        "urlset"
-    ):
-        for loc in root.findall(
-            ".//{*}loc"
-        ):
-            value = (
-                loc.text or ""
-            ).strip()
+    elif tag.endswith("urlset"):
+        for loc in root.findall(".//{*}loc"):
+            value = (loc.text or "").strip()
 
-            if (
-                value
-                and _sq_safe_provider_url(
-                    provider,
-                    value
-                )
-            ):
-                urls.append(
-                    value
-                )
+            if value and _sq_same_host(value, provider["base"]):
+                urls.append(value)
 
     return urls, children
 
 
-def _sq_site_urls(
-    provider
-):
+def _sq_site_urls(provider):
     key = provider["name"]
     now = _sq_time.time()
-    cached = _SQ_SITEMAP_CACHE.get(
-        key
-    )
+    cached = _SQ_SITE_URLS_CACHE.get(key)
 
-    if (
-        cached
-        and now - cached["time"] < _SQ_SITEMAP_TTL
-    ):
+    if cached and now - cached["time"] < _SQ_SITE_CACHE_TTL:
         return cached["urls"]
 
-    base = provider["base"].rstrip(
-        "/"
-    )
-
+    base = provider["base"].rstrip("/")
     queue = [
         base + "/sitemap.xml",
         base + "/sitemap_index.xml"
@@ -11959,173 +11628,61 @@ def _sq_site_urls(
             r"(?im)^\s*Sitemap:\s*(\S+)",
             robots
         ):
-            if _sq_safe_provider_url(
-                provider,
-                match
-            ):
-                queue.insert(
-                    0,
-                    match
-                )
+            if _sq_same_host(match, base):
+                queue.insert(0, match)
     except Exception:
         pass
 
+    urls = []
     seen_maps = set()
-    all_urls = []
 
-    while (
-        queue
-        and len(seen_maps) < 12
-    ):
-        sitemap_url = queue.pop(
-            0
-        )
+    while queue and len(seen_maps) < 16:
+        sitemap_url = queue.pop(0)
 
         if sitemap_url in seen_maps:
             continue
 
-        seen_maps.add(
-            sitemap_url
-        )
+        seen_maps.add(sitemap_url)
 
         try:
             xml_text = _sq_fetch(
                 sitemap_url,
-                timeout=7,
-                max_bytes=4_000_000
+                timeout=8,
+                max_bytes=5_000_000
             )
         except Exception:
             continue
 
-        urls, child_maps = _sq_parse_sitemap(
+        found, children = _sq_parse_sitemap(
             xml_text,
             provider
         )
 
-        all_urls.extend(
-            urls
-        )
+        urls.extend(found)
 
-        for child in child_maps:
+        for child in children:
             if child not in seen_maps:
-                queue.append(
-                    child
-                )
+                queue.append(child)
 
-    result = []
+    unique = []
     seen = set()
 
-    for url in all_urls:
-        clean = str(
-            url
-        ).split("#", 1)[0]
+    for url in urls:
+        clean = url.split("#", 1)[0]
 
         if clean not in seen:
-            seen.add(
-                clean
-            )
-            result.append(
-                clean
-            )
+            seen.add(clean)
+            unique.append(clean)
 
-    _SQ_SITEMAP_CACHE[
-        key
-    ] = {
-        "time":
-            now,
-        "urls":
-            result
+    _SQ_SITE_URLS_CACHE[key] = {
+        "time": now,
+        "urls": unique
     }
 
-    return result
+    return unique
 
 
-def _sq_query_tokens(
-    query
-):
-    stop = {
-        "de",
-        "del",
-        "la",
-        "el",
-        "los",
-        "las",
-        "y",
-        "con",
-        "para",
-        "natural",
-        "cosmetica",
-        "cosmetico"
-    }
-
-    return [
-        token
-        for token in _sq_norm(
-            query
-        ).split()
-        if (
-            token
-            and token not in stop
-        )
-    ]
-
-
-def _sq_candidate_score(
-    text,
-    query,
-    quantity,
-    unit
-):
-    haystack = _sq_norm(
-        text
-    )
-    tokens = _sq_query_tokens(
-        query
-    )
-
-    if not haystack:
-        return -999
-
-    score = 0
-
-    if _sq_norm(
-        query
-    ) in haystack:
-        score += 30
-
-    for token in tokens:
-        if token in haystack:
-            score += 8
-
-    size = _sq_find_size(
-        text
-    )
-
-    if (
-        size
-        and size["unit"] == _sq_unit(
-            unit
-        )
-    ):
-        if _sq_same_quantity(
-            size["quantity"],
-            quantity
-        ):
-            score += 30
-        else:
-            score += 3
-
-    return score
-
-
-def _sq_extract_links(
-    html,
-    current_url,
-    provider,
-    query,
-    quantity,
-    unit
-):
+def _sq_extract_links(html, current_url, provider, query):
     result = []
 
     for href, inner in _sq_re.findall(
@@ -12134,976 +11691,1012 @@ def _sq_extract_links(
     ):
         url = _sq_urljoin(
             current_url,
-            _sq_unescape(
-                href
-            ).strip()
+            _sq_unescape(href).strip()
         )
 
-        if not _sq_safe_provider_url(
-            provider,
-            url
-        ):
+        if not url.startswith(("http://", "https://")):
             continue
 
-        label = _sq_strip_html(
-            inner
-        )
+        if not _sq_same_host(url, provider["base"]):
+            continue
 
+        label = _sq_strip_html(inner)
         score = max(
-            _sq_candidate_score(
-                label,
-                query,
-                quantity,
-                unit
-            ),
-            _sq_candidate_score(
-                url,
-                query,
-                quantity,
-                unit
-            )
+            _sq_score_text(label, query),
+            _sq_score_text(url, query)
         )
 
         if score > 0:
             result.append({
-                "url":
-                    url.split("#", 1)[0],
-                "title":
-                    label,
-                "score":
-                    score
+                "url": url.split("#", 1)[0],
+                "score": score
             })
 
     return result
 
 
-def _sq_candidates(
-    provider,
-    query,
-    quantity,
-    unit
-):
-    found = []
+def _sq_candidate_urls(provider, query):
+    candidates = []
 
-    for url in _sq_site_urls(
-        provider
-    ):
-        score = _sq_candidate_score(
-            url,
-            query,
-            quantity,
-            unit
-        )
+    for url in _sq_site_urls(provider):
+        score = _sq_score_text(url, query)
 
         if score > 0:
-            found.append({
-                "url":
-                    url,
-                "title":
-                    "",
-                "score":
-                    score
+            candidates.append({
+                "url": url,
+                "score": score
             })
 
-    base = provider["base"].rstrip(
-        "/"
-    )
-    encoded = _sq_quote(
-        query
-    )
+    base = provider["base"].rstrip("/")
+    encoded = _sq_quote(query)
 
     search_urls = [
         f"{base}/productos/?q={encoded}",
         f"{base}/buscar?q={encoded}",
-        f"{base}/search?q={encoded}",
+        f"{base}/search?q={encoded}"
     ]
 
-    for path in provider.get(
-        "fallback_paths",
-        []
+    search_urls.extend(
+        _sq_urljoin(base + "/", path.lstrip("/"))
+        for path in provider.get("fallback_paths", [])
+    )
+
+    for search_url in search_urls[:10]:
+        try:
+            html = _sq_fetch(search_url, timeout=8)
+        except Exception:
+            continue
+
+        for item in _sq_extract_links(
+            html,
+            search_url,
+            provider,
+            query
+        ):
+            candidates.append(item)
+
+    best_by_url = {}
+
+    for item in candidates:
+        current = best_by_url.get(item["url"])
+
+        if current is None or item["score"] > current["score"]:
+            best_by_url[item["url"]] = item
+
+    result = list(best_by_url.values())
+    result.sort(
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    return result[:30]
+
+
+def _sq_money_matches(text):
+    result = []
+
+    for match in _sq_re.finditer(
+        r"\$\s*([0-9][0-9.\s]*(?:,[0-9]{1,2})?)",
+        text or ""
     ):
-        search_urls.append(
-            _sq_urljoin(
-                base + "/",
-                path.lstrip("/")
+        price = _sq_price_number(match.group(1))
+
+        if price is not None:
+            result.append(
+                (match.start(), price, match.group(0))
             )
+
+    return result
+
+
+def _sq_keyed_price_matches(text):
+    result = []
+
+    patterns = [
+        r'(?i)["\'](?:price|precio|regular_price|list_price|amount|final_price)["\']'
+        r'\s*:\s*["\']?\$?\s*([0-9][0-9.,]*)',
+        r'(?i)(?:data-price|data-precio|data-value-price)'
+        r'\s*=\s*["\']\$?\s*([0-9][0-9.,]*)["\']'
+    ]
+
+    for pattern in patterns:
+        for match in _sq_re.finditer(pattern, text or ""):
+            price = _sq_price_number(match.group(1))
+
+            if price is not None:
+                result.append(
+                    (match.start(), price, match.group(0))
+                )
+
+    return result
+
+
+def _sq_size_occurrences(text, requested_unit):
+    result = []
+
+    for match in _sq_re.finditer(
+        r"(?i)\b([0-9]+(?:[.,][0-9]+)?)\s*"
+        r"(cc|ml|mililitros?|l|lt|lts|litros?|g|gr|grs|gramos?|kg|kilo|kilos)\b",
+        text or ""
+    ):
+        converted = _sq_convert_size(
+            match.group(1),
+            match.group(2)
         )
 
-    for search_url in search_urls[:6]:
+        if not converted:
+            continue
+
+        quantity, unit = converted
+        requested = _sq_norm(requested_unit)
+
+        if requested.startswith("ml") and unit != "ml":
+            continue
+
+        if requested.startswith("g") and unit != "g":
+            continue
+
+        result.append({
+            "pos": match.start(),
+            "quantity": quantity,
+            "unit": unit,
+            "raw": match.group(0)
+        })
+
+    return result
+
+
+def _sq_dedupe_variants(variants, max_quantity):
+    result = []
+    seen = set()
+
+    for item in variants:
+        quantity = float(item.get("quantity") or 0)
+        price = float(item.get("price") or 0)
+        unit = item.get("unit") or ""
+
+        if quantity <= 0 or price <= 0:
+            continue
+
+        if max_quantity and max_quantity > 0 and quantity > max_quantity:
+            continue
+
+        # Evitar números evidentemente ajenos al precio/presentación.
+        if price < 50 or price > 50_000_000:
+            continue
+
+        key = (
+            round(quantity, 4),
+            unit,
+            round(price, 2)
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append({
+            **item,
+            "quantity": quantity,
+            "price": price
+        })
+
+    return result
+
+
+def _sq_extract_empretienda_variants(
+    html,
+    requested_unit,
+    max_quantity
+):
+    variants = []
+
+    # 1. Tags que contengan presentación y precio juntos.
+    tag_pattern = _sq_re.compile(
+        r"(?is)<[^>]{0,2500}>"
+    )
+
+    for match in tag_pattern.finditer(html or ""):
+        tag = match.group(0)
+        sizes = _sq_size_occurrences(
+            tag,
+            requested_unit
+        )
+
+        if not sizes:
+            continue
+
+        prices = (
+            _sq_keyed_price_matches(tag)
+            + _sq_money_matches(tag)
+        )
+
+        if not prices:
+            continue
+
+        for size in sizes:
+            nearest = min(
+                prices,
+                key=lambda price:
+                    abs(price[0] - size["pos"])
+            )
+            variants.append({
+                "quantity": size["quantity"],
+                "unit": size["unit"],
+                "price": nearest[1],
+                "source": "tag"
+            })
+
+    # 2. Objetos JS/JSON dentro de scripts.
+    scripts = _sq_re.findall(
+        r"(?is)<script[^>]*>(.*?)</script>",
+        html or ""
+    )
+
+    for script in scripts:
+        sizes = _sq_size_occurrences(
+            script,
+            requested_unit
+        )
+
+        if not sizes:
+            continue
+
+        keyed_prices = _sq_keyed_price_matches(script)
+
+        if not keyed_prices:
+            continue
+
+        for size in sizes:
+            # Solo vinculamos precios relativamente cercanos en el script.
+            nearby = [
+                price
+                for price in keyed_prices
+                if abs(price[0] - size["pos"]) <= 1200
+            ]
+
+            if not nearby:
+                continue
+
+            nearest = min(
+                nearby,
+                key=lambda price:
+                    abs(price[0] - size["pos"])
+            )
+
+            variants.append({
+                "quantity": size["quantity"],
+                "unit": size["unit"],
+                "price": nearest[1],
+                "source": "script"
+            })
+
+    variants = _sq_dedupe_variants(
+        variants,
+        max_quantity
+    )
+
+    # Si la misma presentación aparece con precios distintos,
+    # preferimos el valor que más se repite. Si empatan,
+    # conservamos el mayor (precio de lista antes de descuento).
+    grouped = {}
+
+    for item in variants:
+        key = (
+            round(item["quantity"], 4),
+            item["unit"]
+        )
+        grouped.setdefault(key, []).append(item)
+
+    final = []
+
+    for key, items in grouped.items():
+        counts = {}
+
+        for item in items:
+            pkey = round(item["price"], 2)
+            counts[pkey] = counts.get(pkey, 0) + 1
+
+        best_price = sorted(
+            counts.items(),
+            key=lambda pair: (pair[1], pair[0]),
+            reverse=True
+        )[0][0]
+
+        final.append({
+            "quantity": key[0],
+            "unit": key[1],
+            "price": best_price,
+            "source": "variant"
+        })
+
+    return final
+
+
+def _sq_extract_page_price(html):
+    # JSON-LD con un precio único.
+    blocks = _sq_re.findall(
+        r'(?is)<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html or ""
+    )
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            yield obj
+            for value in obj.values():
+                yield from walk(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                yield from walk(value)
+
+    for block in blocks:
+        try:
+            data = _sq_json.loads(block.strip())
+        except Exception:
+            continue
+
+        for obj in walk(data):
+            obj_type = str(obj.get("@type", "")).lower()
+
+            if obj_type == "product":
+                offers = obj.get("offers")
+
+                if isinstance(offers, dict):
+                    value = offers.get("price")
+
+                    if value not in (None, ""):
+                        price = _sq_price_number(value)
+
+                        if price:
+                            return price
+
+                if isinstance(offers, list):
+                    prices = []
+
+                    for offer in offers:
+                        if not isinstance(offer, dict):
+                            continue
+
+                        value = offer.get("price")
+
+                        if value not in (None, ""):
+                            price = _sq_price_number(value)
+
+                            if price:
+                                prices.append(price)
+
+                    if len(set(prices)) == 1 and prices:
+                        return prices[0]
+
+    # Metas de precio.
+    for pattern in [
+        r'(?is)<meta[^>]+property=["\']product:price:amount["\'][^>]+content=["\']([^"\']+)',
+        r'(?is)<meta[^>]+itemprop=["\']price["\'][^>]+content=["\']([^"\']+)'
+    ]:
+        match = _sq_re.search(pattern, html or "")
+
+        if match:
+            price = _sq_price_number(match.group(1))
+
+            if price:
+                return price
+
+    # Primer precio visible del cuerpo.
+    clean = _sq_strip_html(html)
+    prices = _sq_money_matches(clean)
+
+    if prices:
+        return prices[0][1]
+
+    return None
+
+
+def _sq_find_product_card(html, query):
+    candidates = []
+
+    # Tiendanube suele envolver cada producto en un enlace.
+    for href, inner in _sq_re.findall(
+        r'(?is)<a[^>]+href=["\']([^"\']*/productos/[^"\']+)["\'][^>]*>(.*?)</a>',
+        html or ""
+    ):
+        text = _sq_strip_html(inner)
+
+        if not _sq_title_acceptable(text, query):
+            continue
+
+        prices = _sq_money_matches(text)
+
+        if not prices:
+            continue
+
+        # El primer monto del card es el precio normal publicado.
+        price = prices[0][1]
+        url = _sq_urljoin(
+            "https://www.psyn.com.ar/",
+            href
+        )
+
+        candidates.append({
+            "score": _sq_score_text(text, query),
+            "price": price,
+            "url": url,
+            "text": text
+        })
+
+    if not candidates:
+        # Fallback sobre texto plano: útil si el HTML cambia.
+        clean = _sq_strip_html(html)
+        normalized_query = _sq_norm(query)
+        variants = _sq_query_variants(query)
+
+        positions = []
+
+        for variant in variants:
+            if not variant:
+                continue
+
+            start = 0
+
+            while True:
+                pos = _sq_norm(clean).find(
+                    _sq_norm(variant),
+                    start
+                )
+
+                if pos < 0:
+                    break
+
+                positions.append(pos)
+                start = pos + len(variant)
+
+        # Este fallback es deliberadamente conservador.
+        for pos in positions[:10]:
+            snippet = clean[
+                max(0, pos - 100):
+                min(len(clean), pos + 900)
+            ]
+
+            if not _sq_title_acceptable(snippet, query):
+                continue
+
+            prices = _sq_money_matches(snippet)
+
+            if prices:
+                candidates.append({
+                    "score": _sq_score_text(snippet, query),
+                    "price": prices[0][1],
+                    "url": "",
+                    "text": snippet
+                })
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    return candidates[0]
+
+
+def _sq_parvati_presentations(requested_unit, max_quantity):
+    requested = _sq_norm(requested_unit)
+    max_q = float(max_quantity or 0)
+
+    if requested.startswith("ml"):
+        values = [
+            (15, "15ml"),
+            (30, "30ml"),
+            (60, "60ml"),
+            (100, "100ml"),
+            (250, "250ml"),
+            (500, "500ml"),
+            (1000, "1litro"),
+            (5000, "5litros")
+        ]
+        unit = "ml"
+    else:
+        values = [
+            (1, "1gramo"),
+            (5, "5grs"),
+            (10, "10grs"),
+            (15, "15grs"),
+            (30, "30grs"),
+            (50, "50grs"),
+            (60, "60grs"),
+            (100, "100grs"),
+            (250, "250grs"),
+            (500, "500grs"),
+            (1000, "1kilo"),
+            (5000, "5kilos")
+        ]
+        unit = "g"
+
+    if max_q > 0:
+        values = [
+            item
+            for item in values
+            if item[0] <= max_q
+        ]
+
+    return [
+        {
+            "quantity": quantity,
+            "unit": unit,
+            "filter": label
+        }
+        for quantity, label in values
+    ]
+
+
+def _sq_parvati_categories(query, requested_unit):
+    normalized = _sq_norm(query)
+
+    if "manteca" in normalized or "cera" in normalized:
+        return [
+            "https://www.psyn.com.ar/"
+            "aceites-polvos-mantecas-y-ceras/"
+            "mantecas-y-ceras1/mantecas-y-ceras/"
+        ]
+
+    if (
+        "aceite" in normalized
+        or _sq_norm(requested_unit).startswith("ml")
+    ):
+        return [
+            "https://www.psyn.com.ar/"
+            "aceites-polvos-mantecas-y-ceras/aceites1/"
+        ]
+
+    # Para otros insumos usamos la categoría amplia.
+    return [
+        "https://www.psyn.com.ar/"
+        "aceites-polvos-mantecas-y-ceras/"
+    ]
+
+
+def _sq_read_parvati(
+    provider,
+    query,
+    requested_unit,
+    max_quantity
+):
+    variants = []
+    product_url = ""
+
+    presentations = _sq_parvati_presentations(
+        requested_unit,
+        max_quantity
+    )
+
+    categories = _sq_parvati_categories(
+        query,
+        requested_unit
+    )
+
+    # Evitamos demasiadas consultas: hasta 8 presentaciones.
+    for presentation in presentations[:8]:
+        found_for_size = None
+
+        for category in categories:
+            url = (
+                category
+                + "?Presentacion="
+                + presentation["filter"]
+            )
+
+            try:
+                html = _sq_fetch(
+                    url,
+                    timeout=10
+                )
+            except Exception:
+                continue
+
+            card = _sq_find_product_card(
+                html,
+                query
+            )
+
+            if card:
+                found_for_size = card
+                break
+
+        if not found_for_size:
+            continue
+
+        product_url = (
+            found_for_size.get("url")
+            or product_url
+        )
+
+        variants.append({
+            "quantity": presentation["quantity"],
+            "unit": presentation["unit"],
+            "price": found_for_size["price"],
+            "source": "parvati_filter"
+        })
+
+    return _sq_dedupe_variants(
+        variants,
+        max_quantity
+    ), product_url
+
+
+def _sq_read_ecosmetica(
+    provider,
+    query,
+    requested_unit,
+    max_quantity
+):
+    variants = []
+    product_url = ""
+    candidate_urls = _sq_candidate_urls(
+        provider,
+        query
+    )
+
+    for candidate in candidate_urls[:18]:
         try:
             html = _sq_fetch(
-                search_url,
-                timeout=7
+                candidate["url"],
+                timeout=9
             )
         except Exception:
             continue
 
-        found.extend(
-            _sq_extract_links(
-                html,
-                search_url,
-                provider,
-                query,
-                quantity,
-                unit
-            )
-        )
+        title = _sq_extract_title(html)
 
-    best_by_url = {}
+        if not _sq_title_acceptable(title, query):
+            continue
 
-    for item in found:
-        current = best_by_url.get(
-            item["url"]
-        )
+        size = _sq_find_size(title)
+
+        if not size:
+            # A veces la presentación figura en la descripción.
+            clean = _sq_strip_html(html)
+            size = _sq_find_size(clean[:2500])
+
+        if not size:
+            continue
+
+        requested = _sq_norm(requested_unit)
+
+        if requested.startswith("ml") and size["unit"] != "ml":
+            continue
+
+        if requested.startswith("g") and size["unit"] != "g":
+            continue
 
         if (
-            current is None
-            or item["score"] > current["score"]
+            max_quantity
+            and max_quantity > 0
+            and size["quantity"] > max_quantity
         ):
-            best_by_url[
-                item["url"]
-            ] = item
+            continue
 
-    first_pass = sorted(
-        best_by_url.values(),
-        key=lambda item:
-            item["score"],
-        reverse=True
-    )[:12]
+        price = _sq_extract_page_price(html)
 
-    detailed = []
+        if not price:
+            continue
 
-    for item in first_pass:
-        title = item.get(
-            "title",
-            ""
-        )
-
-        if not title:
-            try:
-                html = _sq_fetch(
-                    item["url"],
-                    timeout=8
-                )
-                title = _sq_extract_title(
-                    html
-                )
-            except Exception:
-                title = ""
-
-        score = max(
-            item["score"],
-            _sq_candidate_score(
-                title,
-                query,
-                quantity,
-                unit
-            )
-        )
-
-        detailed.append({
-            "url":
-                item["url"],
-            "title":
-                title,
-            "score":
-                score
+        variants.append({
+            "quantity": size["quantity"],
+            "unit": size["unit"],
+            "price": price,
+            "source": "separate_product",
+            "url": candidate["url"],
+            "title": title
         })
 
-    detailed.sort(
-        key=lambda item:
-            item["score"],
+        if not product_url:
+            product_url = candidate["url"]
+
+    return _sq_dedupe_variants(
+        variants,
+        max_quantity
+    ), product_url
+
+
+def _sq_read_empretienda(
+    provider,
+    query,
+    requested_unit,
+    max_quantity
+):
+    candidate_urls = _sq_candidate_urls(
+        provider,
+        query
+    )
+
+    possible = []
+
+    for candidate in candidate_urls[:10]:
+        try:
+            html = _sq_fetch(
+                candidate["url"],
+                timeout=10
+            )
+        except Exception:
+            continue
+
+        title = _sq_extract_title(html)
+
+        if not _sq_title_acceptable(title, query):
+            continue
+
+        variants = _sq_extract_empretienda_variants(
+            html,
+            requested_unit,
+            max_quantity
+        )
+
+        # Si el título trae una presentación concreta y hay un precio único,
+        # esa ficha también es comparable.
+        title_size = _sq_find_size(title)
+
+        if title_size:
+            requested = _sq_norm(requested_unit)
+            unit_ok = (
+                (requested.startswith("ml") and title_size["unit"] == "ml")
+                or
+                (requested.startswith("g") and title_size["unit"] == "g")
+                or
+                not requested
+            )
+
+            if unit_ok:
+                price = _sq_extract_page_price(html)
+
+                if price:
+                    variants.append({
+                        "quantity": title_size["quantity"],
+                        "unit": title_size["unit"],
+                        "price": price,
+                        "source": "title"
+                    })
+
+        variants = _sq_dedupe_variants(
+            variants,
+            max_quantity
+        )
+
+        if variants:
+            possible.append({
+                "score": _sq_score_text(title, query),
+                "title": title,
+                "url": candidate["url"],
+                "variants": variants
+            })
+
+    if not possible:
+        return [], ""
+
+    possible.sort(
+        key=lambda item: (
+            len(item["variants"]),
+            item["score"]
+        ),
         reverse=True
     )
 
-    return detailed[:5]
+    best = possible[0]
+
+    return best["variants"], best["url"]
 
 
-@app.get(
-    "/supplier-quote-sources/{raw_material_id}"
-)
-def get_supplier_quote_sources(
-    raw_material_id: int,
-    quantity: float,
-    unit: str,
-    db: Session = Depends(get_db)
-):
-    _sq_ensure_sources_table(
-        db
-    )
+def _sq_best_variant(variants):
+    if not variants:
+        return None
 
-    normalized_unit = _sq_unit(
-        unit
-    )
-    normalized_quantity = _sq_quantity(
-        quantity
-    )
+    valid = [
+        item
+        for item in variants
+        if item.get("quantity", 0) > 0
+        and item.get("price", 0) > 0
+    ]
 
-    rows = db.execute(
-        _sq_text(
-            """
-            SELECT
-                provider,
-                target_quantity,
-                target_unit,
-                product_url,
-                product_name,
-                manual_price,
-                updated_at
-            FROM supplier_quote_sources
-            WHERE raw_material_id = :raw_material_id
-              AND ABS(target_quantity - :quantity) < 0.0001
-              AND target_unit = :unit
-            """
-        ),
-        {
-            "raw_material_id":
-                raw_material_id,
-            "quantity":
-                normalized_quantity,
-            "unit":
-                normalized_unit
-        }
-    ).mappings().all()
+    if not valid:
+        return None
 
-    by_provider = {
-        row["provider"]:
-            dict(row)
-        for row in rows
-    }
-
-    result = []
-
-    for provider in _SQ_PROVIDERS:
-        saved = by_provider.get(
-            provider["name"]
+    for item in valid:
+        item["unit_cost"] = (
+            item["price"]
+            / item["quantity"]
         )
 
-        if saved:
-            result.append({
-                "provider":
-                    provider["name"],
-                "configured":
-                    True,
-                **saved
-            })
+    valid.sort(
+        key=lambda item: (
+            item["unit_cost"],
+            item["quantity"]
+        )
+    )
+
+    return valid[0]
+
+
+def _sq_provider_unit_quote(
+    provider,
+    query,
+    requested_unit,
+    max_quantity
+):
+    try:
+        if provider["kind"] == "parvati":
+            variants, product_url = _sq_read_parvati(
+                provider,
+                query,
+                requested_unit,
+                max_quantity
+            )
+        elif provider["kind"] == "ecosmetica":
+            variants, product_url = _sq_read_ecosmetica(
+                provider,
+                query,
+                requested_unit,
+                max_quantity
+            )
         else:
-            result.append({
-                "provider":
-                    provider["name"],
-                "configured":
-                    False,
-                "target_quantity":
-                    normalized_quantity,
-                "target_unit":
-                    normalized_unit,
-                "product_url":
-                    "",
-                "product_name":
-                    "",
-                "manual_price":
-                    None,
-                "updated_at":
-                    ""
-            })
-
-    return {
-        "raw_material_id":
-            raw_material_id,
-        "quantity":
-            normalized_quantity,
-        "unit":
-            normalized_unit,
-        "results":
-            result
-    }
-
-
-@app.post(
-    "/supplier-quote-sources/{raw_material_id}"
-)
-def save_supplier_quote_source(
-    raw_material_id: int,
-    data: dict,
-    db: Session = Depends(get_db)
-):
-    _sq_ensure_sources_table(
-        db
-    )
-
-    provider = _sq_provider(
-        data.get("provider")
-    )
-
-    if not provider:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error":
-                    "Proveedor no válido."
-            }
-        )
-
-    url = str(
-        data.get(
-            "product_url",
-            ""
-        )
-        or ""
-    ).strip()
-
-    if not _sq_safe_provider_url(
-        provider,
-        url
-    ):
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error":
-                    f"La URL debe pertenecer a {provider['base']}."
-            }
-        )
-
-    quantity = _sq_quantity(
-        data.get(
-            "target_quantity"
-        )
-    )
-    unit = _sq_unit(
-        data.get(
-            "target_unit"
-        )
-    )
-
-    if quantity <= 0:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error":
-                    "La presentación debe ser mayor a cero."
-            }
-        )
-
-    manual_price = data.get(
-        "manual_price"
-    )
-
-    if manual_price in {
-        "",
-        None
-    }:
-        manual_price = None
-    else:
-        try:
-            manual_price = float(
-                manual_price
-            )
-        except Exception:
-            manual_price = None
-
-        if (
-            manual_price is not None
-            and manual_price <= 0
-        ):
-            manual_price = None
-
-    now = _sq_datetime.now().strftime(
-        "%d/%m/%Y %H:%M"
-    )
-
-    db.execute(
-        _sq_text(
-            """
-            INSERT INTO supplier_quote_sources (
-                raw_material_id,
+            variants, product_url = _sq_read_empretienda(
                 provider,
-                target_quantity,
-                target_unit,
-                product_url,
-                product_name,
-                manual_price,
-                updated_at
+                query,
+                requested_unit,
+                max_quantity
             )
-            VALUES (
-                :raw_material_id,
-                :provider,
-                :target_quantity,
-                :target_unit,
-                :product_url,
-                :product_name,
-                :manual_price,
-                :updated_at
-            )
-            ON CONFLICT (
-                raw_material_id,
-                provider,
-                target_quantity,
-                target_unit
-            )
-            DO UPDATE SET
-                product_url = EXCLUDED.product_url,
-                product_name = EXCLUDED.product_name,
-                manual_price = EXCLUDED.manual_price,
-                updated_at = EXCLUDED.updated_at
-            """
-        ),
-        {
-            "raw_material_id":
-                raw_material_id,
-            "provider":
-                provider["name"],
-            "target_quantity":
-                quantity,
-            "target_unit":
-                unit,
-            "product_url":
-                url,
-            "product_name":
-                str(
-                    data.get(
-                        "product_name",
-                        ""
-                    )
-                    or ""
-                ).strip(),
-            "manual_price":
-                manual_price,
-            "updated_at":
-                now
-        }
-    )
-    db.commit()
 
-    return {
-        "message":
-            "Fuente guardada correctamente.",
-        "provider":
-            provider["name"],
-        "quantity":
-            quantity,
-        "unit":
-            unit
-    }
+        best = _sq_best_variant(variants)
 
-
-@app.delete(
-    "/supplier-quote-sources/{raw_material_id}/{provider_name}"
-)
-def delete_supplier_quote_source(
-    raw_material_id: int,
-    provider_name: str,
-    quantity: float,
-    unit: str,
-    db: Session = Depends(get_db)
-):
-    _sq_ensure_sources_table(
-        db
-    )
-
-    provider = _sq_provider(
-        provider_name
-    )
-
-    if not provider:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error":
-                    "Proveedor no válido."
+        if not best:
+            return {
+                "provider": provider["name"],
+                "status": "not_found",
+                "message":
+                    "No pude vincular con seguridad una presentación y su precio.",
+                "store_url": provider["base"],
+                "product_url": product_url or "",
+                "variants": []
             }
+
+        variants_sorted = sorted(
+            variants,
+            key=lambda item: item["quantity"]
         )
 
-    db.execute(
-        _sq_text(
-            """
-            DELETE FROM supplier_quote_sources
-            WHERE raw_material_id = :raw_material_id
-              AND provider = :provider
-              AND ABS(target_quantity - :quantity) < 0.0001
-              AND target_unit = :unit
-            """
-        ),
-        {
-            "raw_material_id":
-                raw_material_id,
-            "provider":
-                provider["name"],
-            "quantity":
-                _sq_quantity(
-                    quantity
-                ),
-            "unit":
-                _sq_unit(
-                    unit
-                )
+        unit_label = best["unit"]
+
+        return {
+            "provider": provider["name"],
+            "status": "ok",
+            "product_url": product_url,
+            "store_url": provider["base"],
+            "presentation_quantity": best["quantity"],
+            "presentation_unit": unit_label,
+            "price": best["price"],
+            "unit_cost": best["unit_cost"],
+            "normalized_cost": best["unit_cost"] * 100,
+            "variants_count": len(variants_sorted),
+            "variants": [
+                {
+                    "quantity": item["quantity"],
+                    "unit": item["unit"],
+                    "price": item["price"],
+                    "unit_cost": item["price"] / item["quantity"],
+                    "normalized_cost":
+                        item["price"] / item["quantity"] * 100
+                }
+                for item in variants_sorted
+            ],
+            "message":
+                "Mejor precio unitario entre las presentaciones detectadas."
         }
-    )
-    db.commit()
 
-    return {
-        "message":
-            "Fuente eliminada."
-    }
+    except Exception as error:
+        return {
+            "provider": provider["name"],
+            "status": "error",
+            "message":
+                "No se pudo consultar la tienda: "
+                + str(error)[:180],
+            "store_url": provider["base"],
+            "variants": []
+        }
 
 
-@app.get(
-    "/supplier-source-candidates"
-)
-def supplier_source_candidates(
-    provider: str,
+@app.get("/supplier-web-unit-quotes")
+def supplier_web_unit_quotes(
     query: str,
-    quantity: float,
-    unit: str
+    unit: str = "",
+    max_quantity: float = 500
 ):
-    provider_data = _sq_provider(
-        provider
-    )
-
-    if not provider_data:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error":
-                    "Proveedor no válido."
-            }
-        )
-
-    material = str(
-        query or ""
-    ).strip()
+    material = str(query or "").strip()
 
     if len(material) < 2:
         return JSONResponse(
             status_code=400,
             content={
                 "error":
-                    "Indicá la materia prima."
+                    "Indicá una materia prima."
             }
         )
 
-    try:
-        result = _sq_candidates(
-            provider_data,
-            material,
-            _sq_quantity(
-                quantity
-            ),
-            _sq_unit(
-                unit
-            )
-        )
-    except Exception as error:
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error":
-                    "No pude buscar candidatos en esta tienda: "
-                    + str(error)[:180]
-            }
-        )
+    requested_unit = _sq_norm(unit)
 
-    return {
-        "provider":
-            provider_data["name"],
-        "results":
-            [
-                {
-                    "url":
-                        item["url"],
-                    "title":
-                        item["title"]
-                }
-                for item in result
-            ]
-    }
-
-
-def _sq_quote_from_source(
-    provider,
-    source,
-    quantity,
-    unit
-):
-    url = source["product_url"]
-
-    try:
-        html = _sq_fetch(
-            url,
-            timeout=10
-        )
-        title = (
-            _sq_extract_title(
-                html
-            )
-            or source.get(
-                "product_name"
-            )
-            or provider["name"]
-        )
-
-        price = _sq_detect_exact_page_price(
-            html,
-            title,
-            quantity,
-            unit
-        )
-
-        if price:
-            unit_cost = (
-                price
-                / _sq_quantity(
-                    quantity
-                )
-            )
-
-            return {
-                "provider":
-                    provider["name"],
-                "status":
-                    "ok",
-                "product_name":
-                    title,
-                "product_url":
-                    url,
-                "store_url":
-                    provider["base"],
-                "price":
-                    price,
-                "presentation_quantity":
-                    _sq_quantity(
-                        quantity
-                    ),
-                "presentation_unit":
-                    _sq_unit(
-                        unit
-                    ),
-                "normalized_cost":
-                    unit_cost * 100,
-                "estimated_cost":
-                    price,
-                "updated_at":
-                    source.get(
-                        "updated_at",
-                        ""
-                    ),
-                "message":
-                    "Precio leído automáticamente de la fuente configurada."
-            }
-
-        manual_price = source.get(
-            "manual_price"
-        )
-
-        if (
-            manual_price is not None
-            and float(
-                manual_price
-            ) > 0
-        ):
-            price = float(
-                manual_price
-            )
-            unit_cost = (
-                price
-                / _sq_quantity(
-                    quantity
-                )
-            )
-
-            return {
-                "provider":
-                    provider["name"],
-                "status":
-                    "manual",
-                "product_name":
-                    title,
-                "product_url":
-                    url,
-                "store_url":
-                    provider["base"],
-                "price":
-                    price,
-                "presentation_quantity":
-                    _sq_quantity(
-                        quantity
-                    ),
-                "presentation_unit":
-                    _sq_unit(
-                        unit
-                    ),
-                "normalized_cost":
-                    unit_cost * 100,
-                "estimated_cost":
-                    price,
-                "updated_at":
-                    source.get(
-                        "updated_at",
-                        ""
-                    ),
-                "message":
-                    "La tienda no expone el precio de esta variante de forma legible; se usa el precio manual guardado."
-            }
-
-        return {
-            "provider":
-                provider["name"],
-            "status":
-                "needs_manual",
-            "product_name":
-                title,
-            "product_url":
-                url,
-            "store_url":
-                provider["base"],
-            "price":
-                None,
-            "presentation_quantity":
-                _sq_quantity(
-                    quantity
-                ),
-            "presentation_unit":
-                _sq_unit(
-                    unit
-                ),
-            "normalized_cost":
-                None,
-            "estimated_cost":
-                None,
-            "updated_at":
-                source.get(
-                    "updated_at",
-                    ""
-                ),
-            "message":
-                "La ficha es correcta, pero la tienda oculta el precio de esta variante. Podés guardar un precio manual de respaldo."
-        }
-
-    except Exception as error:
-        manual_price = source.get(
-            "manual_price"
-        )
-
-        if (
-            manual_price is not None
-            and float(
-                manual_price
-            ) > 0
-        ):
-            price = float(
-                manual_price
-            )
-            unit_cost = (
-                price
-                / _sq_quantity(
-                    quantity
-                )
-            )
-
-            return {
-                "provider":
-                    provider["name"],
-                "status":
-                    "manual",
-                "product_name":
-                    source.get(
-                        "product_name"
-                    )
-                    or provider["name"],
-                "product_url":
-                    url,
-                "store_url":
-                    provider["base"],
-                "price":
-                    price,
-                "presentation_quantity":
-                    _sq_quantity(
-                        quantity
-                    ),
-                "presentation_unit":
-                    _sq_unit(
-                        unit
-                    ),
-                "normalized_cost":
-                    unit_cost * 100,
-                "estimated_cost":
-                    price,
-                "updated_at":
-                    source.get(
-                        "updated_at",
-                        ""
-                    ),
-                "message":
-                    "No pude consultar la tienda; se usa el precio manual guardado."
-            }
-
-        return {
-            "provider":
-                provider["name"],
-            "status":
-                "error",
-            "product_name":
-                source.get(
-                    "product_name"
-                )
-                or provider["name"],
-            "product_url":
-                url,
-            "store_url":
-                provider["base"],
-            "price":
-                None,
-            "presentation_quantity":
-                _sq_quantity(
-                    quantity
-                ),
-            "presentation_unit":
-                _sq_unit(
-                    unit
-                ),
-            "normalized_cost":
-                None,
-            "estimated_cost":
-                None,
-            "updated_at":
-                source.get(
-                    "updated_at",
-                    ""
-                ),
-            "message":
-                "No se pudo consultar la fuente: "
-                + str(error)[:180]
-        }
-
-
-@app.get(
-    "/supplier-web-quotes"
-)
-def supplier_web_quotes(
-    raw_material_id: int,
-    query: str,
-    unit: str,
-    quantity: float,
-    db: Session = Depends(get_db)
-):
-    material = str(
-        query or ""
-    ).strip()
-
-    normalized_quantity = _sq_quantity(
-        quantity
-    )
-    normalized_unit = _sq_unit(
-        unit
-    )
-
-    if not material:
+    if (
+        not requested_unit.startswith("g")
+        and not requested_unit.startswith("ml")
+        and "gram" not in requested_unit
+        and "mililit" not in requested_unit
+    ):
         return JSONResponse(
             status_code=400,
             content={
                 "error":
-                    "Indicá la materia prima."
+                    "Para comparar precios web la materia prima debe usar g o ml."
             }
         )
 
-    if normalized_quantity <= 0:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error":
-                    "Indicá la cantidad exacta que querés comparar."
-            }
-        )
+    max_q = max(float(max_quantity or 0), 0)
 
-    results = []
+    if max_q <= 0:
+        max_q = 500
 
-    for provider in _SQ_PROVIDERS:
-        source = _sq_source_row(
-            db,
-            raw_material_id,
-            provider["name"],
-            normalized_quantity,
-            normalized_unit
-        )
-
-        if not source:
-            results.append({
-                "provider":
-                    provider["name"],
-                "status":
-                    "not_configured",
-                "product_name":
-                    "",
-                "product_url":
-                    "",
-                "store_url":
-                    provider["base"],
-                "price":
-                    None,
-                "presentation_quantity":
-                    normalized_quantity,
-                "presentation_unit":
-                    normalized_unit,
-                "normalized_cost":
-                    None,
-                "estimated_cost":
-                    None,
-                "message":
-                    "Fuente no configurada para esta presentación."
-            })
-            continue
-
-        results.append(
-            _sq_quote_from_source(
+    with _sq_ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(
+                _sq_provider_unit_quote,
                 provider,
-                dict(source),
-                normalized_quantity,
-                normalized_unit
+                material,
+                requested_unit,
+                max_q
             )
-        )
+            for provider in _SQ_PROVIDERS
+        ]
+
+        results = [
+            future.result()
+            for future in futures
+        ]
 
     comparable = [
         row
         for row in results
-        if (
-            row.get(
-                "normalized_cost"
-            )
-            is not None
-        )
+        if row.get("status") == "ok"
+        and row.get("unit_cost") is not None
     ]
 
     comparable.sort(
-        key=lambda row:
-            row["normalized_cost"]
+        key=lambda row: row["unit_cost"]
     )
 
     rank = {
-        row["provider"]:
-            index + 1
-        for index, row
-        in enumerate(
-            comparable
-        )
+        row["provider"]: index + 1
+        for index, row in enumerate(comparable)
     }
 
     for row in results:
         row["rank"] = rank.get(
-            row["provider"]
+            row.get("provider")
         )
 
+    base_unit = (
+        "ml"
+        if requested_unit.startswith("ml")
+        or "mililit" in requested_unit
+        else "g"
+    )
+
     return {
-        "query":
-            material,
-        "quantity":
-            normalized_quantity,
-        "unit":
-            normalized_unit,
-        "results":
-            results,
+        "query": material,
+        "unit": base_unit,
+        "max_quantity": max_q,
+        "normalization": f"100 {base_unit}",
+        "results": results,
         "price_notes": [
-            "ml y cc se consideran equivalentes.",
-            "La ficha de producto se configura una sola vez por proveedor y presentación.",
-            "El ranking nunca usa una ficha encontrada por nombre sin confirmación.",
-            "Si la tienda oculta el precio de una variante, puede usarse un precio manual de respaldo claramente identificado."
+            "Se comparan las presentaciones detectadas hasta el máximo indicado.",
+            "cc y ml se consideran equivalentes; kg y litros se convierten a g/ml.",
+            "El ranking usa el menor precio por g/ml encontrado en cada proveedor.",
+            "No incluye envío ni descuentos por medio de pago.",
+            "Si no se puede asociar precio + presentación con seguridad, el proveedor queda fuera del ranking."
         ]
     }
