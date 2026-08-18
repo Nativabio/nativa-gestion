@@ -10986,3 +10986,201 @@ def create_supplier(
     db.refresh(item)
 
     return item
+
+# ================= ENCARGOS / IDEAS =================
+from sqlalchemy import text as _notes_text
+from datetime import datetime as _notes_datetime
+
+
+def _ensure_notes_table(db):
+    db.execute(
+        _notes_text(
+            """
+            CREATE TABLE IF NOT EXISTS notes (
+                id SERIAL PRIMARY KEY,
+                kind VARCHAR DEFAULT 'Nota',
+                content TEXT NOT NULL,
+                created_at VARCHAR,
+                updated_at VARCHAR
+            )
+            """
+        )
+    )
+    db.commit()
+
+
+@app.get("/notes")
+def get_notes(
+    db: Session = Depends(get_db)
+):
+    _ensure_notes_table(db)
+
+    rows = db.execute(
+        _notes_text(
+            """
+            SELECT
+                id,
+                kind,
+                content,
+                created_at,
+                updated_at
+            FROM notes
+            ORDER BY id DESC
+            """
+        )
+    ).mappings().all()
+
+    return [
+        {
+            "id": row["id"],
+            "kind": row["kind"] or "Nota",
+            "content": row["content"] or "",
+            "created_at": row["created_at"] or "",
+            "updated_at": row["updated_at"] or ""
+        }
+        for row in rows
+    ]
+
+
+@app.post("/notes")
+def create_note(
+    data: dict,
+    db: Session = Depends(get_db)
+):
+    _ensure_notes_table(db)
+
+    content = str(data.get("content", "") or "").strip()
+    kind = str(data.get("kind", "Nota") or "Nota").strip()
+
+    if not content:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Escribí algo antes de guardar la nota"}
+        )
+
+    if kind not in {"Nota", "Idea", "Encargo"}:
+        kind = "Nota"
+
+    now = _notes_datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    row = db.execute(
+        _notes_text(
+            """
+            INSERT INTO notes (
+                kind,
+                content,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                :kind,
+                :content,
+                :created_at,
+                :updated_at
+            )
+            RETURNING
+                id,
+                kind,
+                content,
+                created_at,
+                updated_at
+            """
+        ),
+        {
+            "kind": kind,
+            "content": content,
+            "created_at": now,
+            "updated_at": now
+        }
+    ).mappings().first()
+
+    db.commit()
+    return dict(row)
+
+
+@app.put("/notes/{note_id}")
+def update_note(
+    note_id: int,
+    data: dict,
+    db: Session = Depends(get_db)
+):
+    _ensure_notes_table(db)
+
+    content = str(data.get("content", "") or "").strip()
+    kind = str(data.get("kind", "Nota") or "Nota").strip()
+
+    if not content:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "La nota no puede quedar vacía"}
+        )
+
+    if kind not in {"Nota", "Idea", "Encargo"}:
+        kind = "Nota"
+
+    now = _notes_datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    row = db.execute(
+        _notes_text(
+            """
+            UPDATE notes
+            SET
+                kind = :kind,
+                content = :content,
+                updated_at = :updated_at
+            WHERE id = :note_id
+            RETURNING
+                id,
+                kind,
+                content,
+                created_at,
+                updated_at
+            """
+        ),
+        {
+            "note_id": note_id,
+            "kind": kind,
+            "content": content,
+            "updated_at": now
+        }
+    ).mappings().first()
+
+    if not row:
+        db.rollback()
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Nota no encontrada"}
+        )
+
+    db.commit()
+    return dict(row)
+
+
+@app.delete("/notes/{note_id}")
+def delete_note(
+    note_id: int,
+    db: Session = Depends(get_db)
+):
+    _ensure_notes_table(db)
+
+    row = db.execute(
+        _notes_text(
+            """
+            DELETE FROM notes
+            WHERE id = :note_id
+            RETURNING id
+            """
+        ),
+        {"note_id": note_id}
+    ).first()
+
+    if not row:
+        db.rollback()
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Nota no encontrada"}
+        )
+
+    db.commit()
+    return {"message": "Nota eliminada correctamente"}
+
