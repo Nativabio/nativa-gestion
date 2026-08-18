@@ -11184,3 +11184,889 @@ def delete_note(
     db.commit()
     return {"message": "Nota eliminada correctamente"}
 
+# ================= COTIZADOR WEB PROVEEDORES =================
+# Consulta publica de precios para el modulo Cotizador.
+# No guarda precios en la base de datos.
+import json as _sq_json
+import re as _sq_re
+import time as _sq_time
+import unicodedata as _sq_unicodedata
+import xml.etree.ElementTree as _sq_et
+from concurrent.futures import ThreadPoolExecutor as _sq_ThreadPoolExecutor
+from html import unescape as _sq_unescape
+from urllib.parse import quote as _sq_quote, urljoin as _sq_urljoin, urlparse as _sq_urlparse
+from urllib.request import Request as _sq_Request, urlopen as _sq_urlopen
+
+_SQ_PROVIDERS = [
+    {
+        "name": "Amizcle",
+        "base": "https://amizcle.empretienda.com.ar",
+        "fallback_paths": [
+            "/productos",
+            "/insumos-cosmetica",
+            "/aceites-naturales",
+            "/insumos-quimicos"
+        ]
+    },
+    {
+        "name": "Ecomarketshop",
+        "base": "https://ecomarketshop.empretienda.com.ar",
+        "fallback_paths": [
+            "/productos",
+            "/materias-primas"
+        ]
+    },
+    {
+        "name": "Parvati",
+        "base": "https://www.psyn.com.ar",
+        "fallback_paths": [
+            "/productos/",
+            "/aceites-polvos-mantecas-y-ceras/"
+        ]
+    },
+    {
+        "name": "Ecosmética",
+        "base": "https://ecosmetica.net",
+        "fallback_paths": [
+            "/productos/"
+        ]
+    }
+]
+
+_SQ_CACHE = {}
+_SQ_SITE_URLS_CACHE = {}
+_SQ_CACHE_TTL = 600
+_SQ_SITE_CACHE_TTL = 21600
+
+_SQ_STOPWORDS = {
+    "de", "del", "la", "el", "los", "las", "y", "con", "para",
+    "natural", "cosmetico", "cosmetica", "virgen", "puro", "pura"
+}
+
+_SQ_ALIASES = {
+    "vit e": ["vitamina e", "tocoferol"],
+    "vitamina e": ["vitamina e", "tocoferol"],
+    "karite": ["karite", "shea"],
+    "rosa mosqueta": ["rosa mosqueta", "mosqueta"],
+    "arbol de te": ["tea tree", "arbol de te"],
+    "tea tree": ["tea tree", "arbol de te"],
+    "cera de abejas": ["cera de abejas", "cera amarilla", "cera abeja"],
+    "agua de rosas": ["agua de rosas", "hidrolato de rosas", "hidrolato rosas"],
+    "hidrolato de rosas": ["hidrolato de rosas", "agua de rosas", "hidrolato rosas"]
+}
+
+
+def _sq_norm(value):
+    text = str(value or "").strip().lower()
+    text = _sq_unicodedata.normalize("NFD", text)
+    text = "".join(
+        char for char in text
+        if _sq_unicodedata.category(char) != "Mn"
+    )
+    text = _sq_re.sub(r"[^a-z0-9]+", " ", text)
+    return _sq_re.sub(r"\s+", " ", text).strip()
+
+
+def _sq_tokens(value):
+    return [
+        token
+        for token in _sq_norm(value).split()
+        if token and token not in _SQ_STOPWORDS
+    ]
+
+
+def _sq_query_variants(query):
+    normalized = _sq_norm(query)
+    variants = [normalized]
+
+    for key, values in _SQ_ALIASES.items():
+        if key in normalized:
+            variants.extend(values)
+
+    # Si la materia prima lleva palabras administrativas, probamos sin ellas.
+    cleaned = _sq_re.sub(
+        r"\b(aceite|manteca|extracto|hidrolato|arcilla|cera)\b",
+        " ",
+        normalized
+    )
+    cleaned = _sq_re.sub(r"\s+", " ", cleaned).strip()
+
+    if cleaned and len(cleaned) >= 3:
+        variants.append(cleaned)
+
+    seen = set()
+    result = []
+
+    for item in variants:
+        item = _sq_norm(item)
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+
+    return result[:5]
+
+
+def _sq_fetch(url, timeout=9, max_bytes=2_500_000):
+    cache_key = ("fetch", url)
+    now = _sq_time.time()
+    cached = _SQ_CACHE.get(cache_key)
+
+    if cached and now - cached["time"] < _SQ_CACHE_TTL:
+        return cached["value"]
+
+    request = _sq_Request(
+        url,
+        headers={
+            "User-Agent":
+                "Mozilla/5.0 (compatible; NativaGestion/1.0; +price-comparison)",
+            "Accept":
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language":
+                "es-AR,es;q=0.9,en;q=0.6"
+        }
+    )
+
+    with _sq_urlopen(request, timeout=timeout) as response:
+        data = response.read(max_bytes)
+
+    text = data.decode("utf-8", errors="ignore")
+    _SQ_CACHE[cache_key] = {
+        "time": now,
+        "value": text
+    }
+    return text
+
+
+def _sq_host(url):
+    return (_sq_urlparse(url).hostname or "").lower()
+
+
+def _sq_same_host(url, base):
+    return _sq_host(url) == _sq_host(base)
+
+
+def _sq_strip_html(html):
+    if not html:
+        return ""
+
+    text = _sq_re.sub(
+        r"(?is)<(script|style|svg).*?>.*?</\1>",
+        " ",
+        html
+    )
+    text = _sq_re.sub(r"(?s)<[^>]+>", " ", text)
+    text = _sq_unescape(text)
+    return _sq_re.sub(r"\s+", " ", text).strip()
+
+
+def _sq_extract_title(html):
+    patterns = [
+        r'(?is)<h1[^>]*>(.*?)</h1>',
+        r'(?is)<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+        r'(?is)<title[^>]*>(.*?)</title>'
+    ]
+
+    for pattern in patterns:
+        match = _sq_re.search(pattern, html or "")
+        if match:
+            value = _sq_strip_html(match.group(1))
+            if value:
+                return value
+
+    return ""
+
+
+def _sq_price_number(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    text = _sq_re.sub(r"[^\d,.\-]", "", text)
+
+    if not text:
+        return None
+
+    if "," in text:
+        # Formato argentino: 6.334,00
+        text = text.replace(".", "").replace(",", ".")
+    elif text.count(".") > 1:
+        text = text.replace(".", "")
+    elif "." in text:
+        left, right = text.rsplit(".", 1)
+        # 6.334 suele ser miles; 6334.50 decimal.
+        if len(right) == 3 and left.replace("-", "").isdigit():
+            text = left + right
+
+    try:
+        number = float(text)
+    except Exception:
+        return None
+
+    if number < 0:
+        return None
+
+    return number
+
+
+def _sq_walk_json_products(obj):
+    if isinstance(obj, dict):
+        obj_type = obj.get("@type")
+
+        if isinstance(obj_type, list):
+            types = [str(item).lower() for item in obj_type]
+        else:
+            types = [str(obj_type or "").lower()]
+
+        if "product" in types:
+            yield obj
+
+        for value in obj.values():
+            yield from _sq_walk_json_products(value)
+
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _sq_walk_json_products(item)
+
+
+def _sq_extract_jsonld(html):
+    blocks = _sq_re.findall(
+        r'(?is)<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html or ""
+    )
+
+    products = []
+
+    for block in blocks:
+        cleaned = block.strip()
+
+        try:
+            data = _sq_json.loads(cleaned)
+        except Exception:
+            continue
+
+        products.extend(list(_sq_walk_json_products(data)))
+
+    return products
+
+
+def _sq_offer_price(offers):
+    candidates = []
+
+    def collect(obj):
+        if isinstance(obj, dict):
+            for key in ("price", "lowPrice", "highPrice"):
+                if key in obj:
+                    number = _sq_price_number(obj.get(key))
+                    if number is not None and number > 0:
+                        candidates.append(number)
+
+            for value in obj.values():
+                collect(value)
+
+        elif isinstance(obj, list):
+            for item in obj:
+                collect(item)
+
+    collect(offers)
+
+    if candidates:
+        return min(candidates)
+
+    return None
+
+
+def _sq_extract_price(html):
+    for product in _sq_extract_jsonld(html):
+        price = _sq_offer_price(product.get("offers"))
+
+        if price is not None:
+            return price
+
+    meta_patterns = [
+        r'(?is)<meta[^>]+property=["\']product:price:amount["\'][^>]+content=["\']([^"\']+)',
+        r'(?is)<meta[^>]+itemprop=["\']price["\'][^>]+content=["\']([^"\']+)',
+        r'(?is)itemprop=["\']price["\'][^>]+content=["\']([^"\']+)'
+    ]
+
+    for pattern in meta_patterns:
+        match = _sq_re.search(pattern, html or "")
+        if match:
+            price = _sq_price_number(match.group(1))
+            if price is not None and price > 0:
+                return price
+
+    text = _sq_strip_html(html)
+
+    currency_matches = _sq_re.findall(
+        r"\$\s*([0-9][0-9.\s]*(?:,[0-9]{1,2})?)",
+        text
+    )
+
+    prices = []
+
+    for value in currency_matches[:30]:
+        price = _sq_price_number(value)
+        if price is not None and price > 0:
+            prices.append(price)
+
+    if prices:
+        # En fichas de producto el primer precio suele ser el principal.
+        return prices[0]
+
+    return None
+
+
+def _sq_parse_size_number(value):
+    text = str(value or "").strip().replace(" ", "")
+    text = text.replace(".", "").replace(",", ".")
+
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def _sq_detect_size(title, html, requested_unit=""):
+    requested = _sq_norm(requested_unit)
+    text = _sq_strip_html(html)
+
+    # Priorizamos una presentacion marcada explicitamente como seleccionada.
+    explicit_patterns = [
+        r"presentaci[oó]n\s*:?\s*([0-9]+(?:[.,][0-9]+)?)\s*(grs?|gramos?|g|kilos?|kg|ml|mililitros?|litros?|lts?|l)\b",
+        r"presentacion\s*:?\s*([0-9]+(?:[.,][0-9]+)?)\s*(grs?|gramos?|g|kilos?|kg|ml|mililitros?|litros?|lts?|l)\b"
+    ]
+
+    sources = [
+        str(title or ""),
+        text[:12000]
+    ]
+
+    def convert(number_text, unit_text):
+        number = _sq_parse_size_number(number_text)
+
+        if number is None or number <= 0:
+            return None
+
+        unit_norm = _sq_norm(unit_text)
+
+        if unit_norm in {"g", "gr", "grs", "gramo", "gramos"}:
+            return number, "g"
+
+        if unit_norm in {"kg", "kilo", "kilos"}:
+            return number * 1000, "g"
+
+        if unit_norm in {"ml", "mililitro", "mililitros"}:
+            return number, "ml"
+
+        if unit_norm in {"l", "lt", "lts", "litro", "litros"}:
+            return number * 1000, "ml"
+
+        return None
+
+    for source in sources:
+        for pattern in explicit_patterns:
+            match = _sq_re.search(
+                pattern,
+                source,
+                flags=_sq_re.IGNORECASE
+            )
+
+            if match:
+                converted = convert(
+                    match.group(1),
+                    match.group(2)
+                )
+
+                if converted:
+                    quantity, unit = converted
+
+                    if requested.startswith("g") and unit != "g":
+                        continue
+                    if requested.startswith("ml") and unit != "ml":
+                        continue
+
+                    return {
+                        "quantity": quantity,
+                        "unit": unit,
+                        "confidence": "high"
+                    }
+
+    # Si no hay presentacion explicita, usamos el titulo.
+    title_patterns = [
+        r"\bx\s*([0-9]+(?:[.,][0-9]+)?)\s*(grs?|gramos?|g|kilos?|kg|ml|mililitros?|litros?|lts?|l)\b",
+        r"\b([0-9]+(?:[.,][0-9]+)?)\s*(grs?|gramos?|g|kilos?|kg|ml|mililitros?|litros?|lts?|l)\b"
+    ]
+
+    for pattern in title_patterns:
+        match = _sq_re.search(
+            pattern,
+            str(title or ""),
+            flags=_sq_re.IGNORECASE
+        )
+
+        if match:
+            converted = convert(
+                match.group(1),
+                match.group(2)
+            )
+
+            if converted:
+                quantity, unit = converted
+
+                if requested.startswith("g") and unit != "g":
+                    continue
+                if requested.startswith("ml") and unit != "ml":
+                    continue
+
+                return {
+                    "quantity": quantity,
+                    "unit": unit,
+                    "confidence": "medium"
+                }
+
+    return None
+
+
+def _sq_score_text(text, query):
+    haystack = _sq_norm(text)
+    if not haystack:
+        return 0
+
+    best = 0
+
+    for variant in _sq_query_variants(query):
+        tokens = _sq_tokens(variant)
+
+        if not tokens:
+            continue
+
+        score = 0
+
+        if variant and variant in haystack:
+            score += 20
+
+        for token in tokens:
+            if token in haystack:
+                score += 5
+            else:
+                score -= 3
+
+        best = max(best, score)
+
+    return best
+
+
+def _sq_extract_links(html, current_url, provider, query):
+    links = []
+
+    pattern = _sq_re.compile(
+        r'(?is)<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>'
+    )
+
+    for href, inner in pattern.findall(html or ""):
+        url = _sq_urljoin(current_url, _sq_unescape(href).strip())
+
+        if not url.startswith(("http://", "https://")):
+            continue
+
+        if not _sq_same_host(url, provider["base"]):
+            continue
+
+        text = _sq_strip_html(inner)
+        score = max(
+            _sq_score_text(text, query),
+            _sq_score_text(url, query)
+        )
+
+        if score > 0:
+            links.append((score, url, text))
+
+    links.sort(key=lambda item: item[0], reverse=True)
+
+    seen = set()
+    result = []
+
+    for score, url, text in links:
+        clean = url.split("#", 1)[0]
+
+        if clean in seen:
+            continue
+
+        seen.add(clean)
+        result.append({
+            "url": clean,
+            "score": score,
+            "text": text
+        })
+
+        if len(result) >= 20:
+            break
+
+    return result
+
+
+def _sq_parse_sitemap(xml_text, provider):
+    urls = []
+    children = []
+
+    try:
+        root = _sq_et.fromstring(xml_text)
+    except Exception:
+        return urls, children
+
+    tag = root.tag.lower()
+
+    if tag.endswith("sitemapindex"):
+        for loc in root.findall(".//{*}loc"):
+            value = (loc.text or "").strip()
+            if value and _sq_same_host(value, provider["base"]):
+                children.append(value)
+
+    elif tag.endswith("urlset"):
+        for loc in root.findall(".//{*}loc"):
+            value = (loc.text or "").strip()
+            if value and _sq_same_host(value, provider["base"]):
+                urls.append(value)
+
+    return urls, children
+
+
+def _sq_site_urls(provider):
+    key = provider["name"]
+    now = _sq_time.time()
+    cached = _SQ_SITE_URLS_CACHE.get(key)
+
+    if cached and now - cached["time"] < _SQ_SITE_CACHE_TTL:
+        return cached["urls"]
+
+    base = provider["base"].rstrip("/")
+    sitemap_candidates = [
+        base + "/sitemap.xml",
+        base + "/sitemap_index.xml"
+    ]
+
+    try:
+        robots = _sq_fetch(base + "/robots.txt", timeout=6, max_bytes=200_000)
+
+        for match in _sq_re.findall(
+            r"(?im)^\s*Sitemap:\s*(\S+)",
+            robots
+        ):
+            if _sq_same_host(match, base):
+                sitemap_candidates.insert(0, match)
+    except Exception:
+        pass
+
+    seen_maps = set()
+    all_urls = []
+    queue = sitemap_candidates[:]
+
+    while queue and len(seen_maps) < 10:
+        sitemap_url = queue.pop(0)
+
+        if sitemap_url in seen_maps:
+            continue
+
+        seen_maps.add(sitemap_url)
+
+        try:
+            xml_text = _sq_fetch(
+                sitemap_url,
+                timeout=7,
+                max_bytes=4_000_000
+            )
+        except Exception:
+            continue
+
+        urls, children = _sq_parse_sitemap(
+            xml_text,
+            provider
+        )
+        all_urls.extend(urls)
+
+        for child in children:
+            if child not in seen_maps and len(queue) < 20:
+                queue.append(child)
+
+    unique = []
+    seen = set()
+
+    for url in all_urls:
+        clean = url.split("#", 1)[0]
+
+        if clean not in seen:
+            seen.add(clean)
+            unique.append(clean)
+
+    _SQ_SITE_URLS_CACHE[key] = {
+        "time": now,
+        "urls": unique
+    }
+
+    return unique
+
+
+def _sq_candidate_urls(provider, query):
+    candidates = []
+
+    for url in _sq_site_urls(provider):
+        score = _sq_score_text(url, query)
+
+        if score > 0:
+            candidates.append({
+                "url": url,
+                "score": score,
+                "source": "sitemap"
+            })
+
+    candidates.sort(
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    if candidates and candidates[0]["score"] >= 10:
+        return candidates[:12]
+
+    base = provider["base"].rstrip("/")
+    encoded = _sq_quote(query)
+
+    search_urls = [
+        f"{base}/productos/?q={encoded}",
+        f"{base}/buscar?q={encoded}",
+        f"{base}/search?q={encoded}"
+    ]
+
+    for path in provider.get("fallback_paths", []):
+        search_urls.append(
+            _sq_urljoin(base + "/", path.lstrip("/"))
+        )
+
+    seen_search = set()
+
+    for search_url in search_urls[:6]:
+        if search_url in seen_search:
+            continue
+
+        seen_search.add(search_url)
+
+        try:
+            html = _sq_fetch(
+                search_url,
+                timeout=7
+            )
+        except Exception:
+            continue
+
+        for item in _sq_extract_links(
+            html,
+            search_url,
+            provider,
+            query
+        ):
+            candidates.append({
+                "url": item["url"],
+                "score": item["score"],
+                "source": "catalog"
+            })
+
+        if candidates:
+            break
+
+    by_url = {}
+
+    for item in candidates:
+        current = by_url.get(item["url"])
+
+        if not current or item["score"] > current["score"]:
+            by_url[item["url"]] = item
+
+    result = list(by_url.values())
+    result.sort(
+        key=lambda item: item["score"],
+        reverse=True
+    )
+    return result[:12]
+
+
+def _sq_provider_quote(provider, query, requested_unit, desired_quantity):
+    try:
+        candidates = _sq_candidate_urls(
+            provider,
+            query
+        )
+
+        if not candidates:
+            return {
+                "provider": provider["name"],
+                "status": "not_found",
+                "message":
+                    "No encontré una ficha coincidente en la tienda.",
+                "store_url": provider["base"]
+            }
+
+        best = None
+
+        for candidate in candidates[:4]:
+            try:
+                html = _sq_fetch(
+                    candidate["url"],
+                    timeout=9
+                )
+            except Exception:
+                continue
+
+            title = _sq_extract_title(html)
+            page_score = max(
+                _sq_score_text(title, query),
+                _sq_score_text(candidate["url"], query)
+            )
+
+            # Evitamos confundir productos poco relacionados.
+            if page_score <= 0:
+                continue
+
+            price = _sq_extract_price(html)
+
+            if price is None or price <= 0:
+                continue
+
+            size = _sq_detect_size(
+                title,
+                html,
+                requested_unit
+            )
+
+            row = {
+                "provider": provider["name"],
+                "status": "ok",
+                "product_name": title or query,
+                "product_url": candidate["url"],
+                "store_url": provider["base"],
+                "price": price,
+                "presentation_quantity":
+                    size["quantity"] if size else None,
+                "presentation_unit":
+                    size["unit"] if size else "",
+                "presentation_confidence":
+                    size["confidence"] if size else "none",
+                "normalized_cost": None,
+                "estimated_cost": None,
+                "score": page_score,
+                "message":
+                    "" if size
+                    else "Precio encontrado, pero no pude detectar con seguridad la presentación."
+            }
+
+            if size and size["quantity"] > 0:
+                unit_cost = price / size["quantity"]
+
+                # Costo normalizado por 100 g / 100 ml.
+                row["normalized_cost"] = unit_cost * 100
+
+                if desired_quantity and desired_quantity > 0:
+                    row["estimated_cost"] = (
+                        unit_cost * desired_quantity
+                    )
+
+            if best is None or row["score"] > best["score"]:
+                best = row
+
+            # Una coincidencia clara ya es suficiente.
+            if page_score >= 20 and size:
+                break
+
+        if best:
+            return best
+
+        return {
+            "provider": provider["name"],
+            "status": "not_found",
+            "message":
+                "Encontré posibles resultados, pero no pude leer un precio confiable.",
+            "store_url": provider["base"]
+        }
+
+    except Exception as error:
+        return {
+            "provider": provider["name"],
+            "status": "error",
+            "message":
+                "No se pudo consultar la tienda en este momento: "
+                + str(error)[:180],
+            "store_url": provider["base"]
+        }
+
+
+@app.get("/supplier-web-quotes")
+def supplier_web_quotes(
+    query: str,
+    unit: str = "",
+    quantity: float = 0
+):
+    material = str(query or "").strip()
+
+    if len(material) < 2:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error":
+                    "Indicá una materia prima para consultar."
+            }
+        )
+
+    requested_unit = _sq_norm(unit)
+    desired_quantity = max(float(quantity or 0), 0)
+
+    with _sq_ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(
+                _sq_provider_quote,
+                provider,
+                material,
+                requested_unit,
+                desired_quantity
+            )
+            for provider in _SQ_PROVIDERS
+        ]
+
+        results = [
+            future.result()
+            for future in futures
+        ]
+
+    comparable = [
+        row
+        for row in results
+        if row.get("status") == "ok"
+        and row.get("normalized_cost") is not None
+    ]
+
+    comparable.sort(
+        key=lambda row: row["normalized_cost"]
+    )
+
+    rank_by_provider = {
+        row["provider"]: index + 1
+        for index, row in enumerate(comparable)
+    }
+
+    for row in results:
+        row["rank"] = rank_by_provider.get(
+            row.get("provider")
+        )
+        row.pop("score", None)
+
+    return {
+        "query": material,
+        "unit": unit,
+        "quantity": desired_quantity,
+        "normalization":
+            "100 g / 100 ml según la unidad de la materia prima",
+        "price_notes": [
+            "Son precios publicados en la web al momento de la consulta.",
+            "No incluyen envío.",
+            "No se aplican descuentos por efectivo, transferencia, mayorista o cupones.",
+            "Si la presentación no puede detectarse con seguridad, el proveedor no entra al ranking."
+        ],
+        "results": results
+    }
