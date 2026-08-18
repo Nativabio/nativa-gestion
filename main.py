@@ -3968,7 +3968,20 @@ def get_sales(
 
     items_by_sale = {}
 
+    historical_product_ids = {
+        product.id
+        for product in products
+        if str(product.name or "").strip()
+        == "__PRODUCTO_ELIMINADO_HISTORICO__"
+    }
+
     for item in sale_items:
+        # FILTRO PRODUCTO HISTORICO EN VENTAS:
+        # El registro técnico se conserva en la base, pero no se expone en
+        # Historial de Ventas, edición de ventas ni rankings que usan /sales.
+        # No se modifica stock, lotes, importes ni contabilidad.
+        if item.product_id in historical_product_ids:
+            continue
 
         items_by_sale.setdefault(
             item.sale_id,
