@@ -8153,13 +8153,69 @@ def dashboard(
     )
 
 
+    # NATIVA_DASHBOARD_SOLO_PRODUCTOS_TERMINADOS
+    # La tarjeta "Producción del mes" debe representar únicamente
+    # productos terminados. Materias primas elaboradas como oleatos
+    # quedan fuera tanto de las unidades como de la cantidad de lotes.
+    finished_product_lots_month_list = []
+
+    for lot in lots_month_list:
+
+        formula = formula_by_id.get(
+            lot.formula_id
+        )
+
+        output_type = str(
+            getattr(
+                lot,
+                "output_type",
+                ""
+            )
+            or
+            getattr(
+                formula,
+                "output_type",
+                ""
+            )
+            or
+            (
+                "RAW_MATERIAL"
+                if (
+                    getattr(
+                        lot,
+                        "output_raw_material_id",
+                        None
+                    )
+                    or
+                    getattr(
+                        formula,
+                        "output_raw_material_id",
+                        None
+                    )
+                )
+                else
+                "PRODUCT"
+            )
+        ).strip().upper()
+
+        if output_type not in {
+            "RAW_MATERIAL",
+            "INTERMEDIATE",
+            "MATERIA_PRIMA"
+        }:
+
+            finished_product_lots_month_list.append(
+                lot
+            )
+
+
     production_units_month = sum(
 
         numeric(
             lot.units_produced
         )
 
-        for lot in lots_month_list
+        for lot in finished_product_lots_month_list
 
     )
 
@@ -8262,7 +8318,7 @@ def dashboard(
 
         "production_lots_month":
         len(
-            lots_month_list
+            finished_product_lots_month_list
         ),
 
         "production_units_month":
