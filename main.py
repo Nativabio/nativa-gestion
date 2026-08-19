@@ -12520,6 +12520,7 @@ def _sq_provider_unit_quote(
     provider,
     query,
     requested_unit,
+    min_quantity,
     max_quantity
 ):
     try:
@@ -12544,6 +12545,15 @@ def _sq_provider_unit_quote(
                 requested_unit,
                 max_quantity
             )
+
+        min_q = max(float(min_quantity or 0), 0)
+
+        if min_q > 0:
+            variants = [
+                item
+                for item in variants
+                if float(item.get("quantity") or 0) >= min_q
+            ]
 
         best = _sq_best_variant(variants)
 
@@ -12607,6 +12617,7 @@ def _sq_provider_unit_quote(
 def supplier_web_unit_quotes(
     query: str,
     unit: str = "",
+    min_quantity: float = 0,
     max_quantity: float = 500
 ):
     material = str(query or "").strip()
@@ -12636,10 +12647,20 @@ def supplier_web_unit_quotes(
             }
         )
 
+    min_q = max(float(min_quantity or 0), 0)
     max_q = max(float(max_quantity or 0), 0)
 
     if max_q <= 0:
         max_q = 500
+
+    if min_q > max_q:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error":
+                    "La presentación mínima no puede ser mayor que la máxima."
+            }
+        )
 
     with _sq_ThreadPoolExecutor(max_workers=4) as executor:
         futures = [
@@ -12648,6 +12669,7 @@ def supplier_web_unit_quotes(
                 provider,
                 material,
                 requested_unit,
+                min_q,
                 max_q
             )
             for provider in _SQ_PROVIDERS
@@ -12689,11 +12711,12 @@ def supplier_web_unit_quotes(
     return {
         "query": material,
         "unit": base_unit,
+        "min_quantity": min_q,
         "max_quantity": max_q,
         "normalization": f"100 {base_unit}",
         "results": results,
         "price_notes": [
-            "Se comparan las presentaciones detectadas hasta el máximo indicado.",
+            "Se comparan solo las presentaciones detectadas dentro del rango mínimo/máximo indicado.",
             "cc y ml se consideran equivalentes; kg y litros se convierten a g/ml.",
             "El ranking usa el menor precio por g/ml encontrado en cada proveedor.",
             "No incluye envío ni descuentos por medio de pago.",
