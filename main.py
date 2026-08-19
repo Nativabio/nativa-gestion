@@ -8141,6 +8141,13 @@ def dashboard(
     )
 
 
+    # NATIVA_DASHBOARD_COMPRAS_TOTALES
+    purchases_total = sum(
+        numeric(purchase.total)
+        for purchase in purchases
+    )
+
+
     purchases_month = sum(
 
         numeric(
@@ -8273,6 +8280,12 @@ def dashboard(
         "sales_count_month":
         len(
             sales_month_list
+        ),
+
+        "purchases_total":
+        round(
+            purchases_total,
+            2
         ),
 
         "purchases_month":
