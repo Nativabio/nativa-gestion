@@ -5593,6 +5593,10 @@ def get_purchases(
             "shipping_cost": float(
                 metadata.get("shipping_cost", 0) or 0
             ),
+            "shipping_payment_method": metadata.get(
+                "shipping_payment_method",
+                "Caja"
+            ),
             "extra_items": extra_items,
             "total": float(purchase.total or 0),
             "items": items_by_purchase.get(purchase.id, []),
@@ -5746,44 +5750,62 @@ def remove_purchase_installments(db, purchase):
         db.delete(installment)
 
 
-def create_purchase_installments(db, purchase, total, count):
-    if count <= 0:
-        return
-
-    purchase_date = parse_date_value(purchase.date, "fecha de compra")
+def calculate_installment_amounts(total, count):
     total = round(float(total or 0), 2)
+    count = int(count or 0)
+
+    if count <= 0:
+        return []
+
     base_amount = round(total / count, 2)
     remaining = total
+    amounts = []
 
     for number in range(1, count + 1):
-        amount = base_amount if number < count else round(remaining, 2)
+        amount = (
+            base_amount
+            if number < count
+            else round(remaining, 2)
+        )
+        amounts.append(amount)
         remaining = round(remaining - amount, 2)
 
-        db.add(PurchaseInstallment(
+    return amounts
+
+
+def create_purchase_installments(db, purchase, total, count):
+    if count <= 0:
+        return []
+
+    purchase_date = parse_date_value(
+        purchase.date,
+        "fecha de compra"
+    )
+    amounts = calculate_installment_amounts(total, count)
+    installments = []
+
+    for number, amount in enumerate(amounts, start=1):
+        installment = PurchaseInstallment(
             purchase_id=purchase.id,
             installment_number=number,
             total_installments=count,
-            due_date=str(purchase_date + timedelta(days=30 * number)),
+            due_date=str(
+                purchase_date
+                + timedelta(days=30 * (number - 1))
+            ),
             amount=amount,
-            posted=0
-        ))
+            posted=1 if number == 1 else 0,
+            posted_date=(
+                purchase.date
+                if number == 1
+                else None
+            )
+        )
+        db.add(installment)
+        installments.append(installment)
 
     db.flush()
-
-    registrar_asiento(
-        db=db,
-        fecha=purchase.date,
-        concepto=f"Cuotas tarjeta compra {purchase.number}",
-        debe_codigo="2.1.03",
-        debe_nombre="Tarjeta de crédito a pagar",
-        haber_codigo="2.1.04",
-        haber_nombre="Cuotas de tarjeta a vencer",
-        importe=total,
-        origin="CUOTAS_TARJETA",
-        origin_id=purchase.id
-    )
-
-
+    return installments
 def post_due_credit_card_installments(db):
     today = datetime.now(
         timezone(timedelta(hours=-3))
@@ -6402,8 +6424,14 @@ def apply_purchase_contents(
             "La compra no tiene importes válidos"
         )
 
+    shipping_payment_method = str(
+        data.get("shipping_payment_method", "Caja")
+        or "Caja"
+    ).strip()
+
     metadata = {
         "shipping_cost": shipping_cost,
+        "shipping_payment_method": shipping_payment_method,
         "extra_items": extra_items_with_shipping,
         "notes": str(data.get("notes", "") or "")
     }
@@ -6418,6 +6446,37 @@ def apply_purchase_contents(
     payment_code, payment_name = purchase_payment_account(
         purchase.payment_method
     )
+    shipping_payment_code, shipping_payment_name = (
+        purchase_payment_account(shipping_payment_method)
+    )
+    installments_count = purchase_installments_count(
+        purchase,
+        data
+    )
+
+    base_purchase_total = round(
+        inventory_base_total + extra_base_total,
+        2
+    )
+    shipping_is_separate = (
+        shipping_cost > 0
+        and normalize_account_label(
+            shipping_payment_method
+        ) != normalize_account_label(
+            purchase.payment_method
+        )
+    )
+    card_installment_total = base_purchase_total
+
+    if (
+        installments_count > 0
+        and not shipping_is_separate
+        and normalize_account_label(
+            purchase.payment_method
+        ) in {"tarjeta", "tarjeta de credito"}
+    ):
+        card_installment_total = round(total, 2)
+
     group_id = str(uuid4())
 
     if material_total > 0:
@@ -6468,32 +6527,95 @@ def apply_purchase_contents(
             )
         )
 
-    db.add(
-        JournalEntry(
-            date=purchase.date,
-            concept=f"Compra {purchase.number}",
-            account_code=payment_code,
-            account_name=payment_name,
-            debit=0,
-            credit=total,
-            entry_group=group_id,
-            origin="COMPRA",
-            origin_id=purchase.id
+    card_purchase = normalize_account_label(
+        purchase.payment_method
+    ) in {"tarjeta", "tarjeta de credito"}
+
+    installment_amounts = (
+        calculate_installment_amounts(
+            card_installment_total,
+            installments_count
         )
+        if card_purchase and installments_count > 0
+        else []
     )
+
+    if card_purchase and installment_amounts:
+
+        for number, amount in enumerate(installment_amounts, start=1):
+            account_code = (
+                "2.1.03"
+                if number == 1
+                else "2.1.04"
+            )
+            account_name = (
+                "Tarjeta de crédito a pagar"
+                if number == 1
+                else "Cuotas de tarjeta a vencer"
+            )
+            db.add(
+                JournalEntry(
+                    date=purchase.date,
+                    concept=(
+                        f"Compra {purchase.number} - "
+                        f"Cuota {number}/{installments_count}"
+                    ),
+                    account_code=account_code,
+                    account_name=account_name,
+                    debit=0,
+                    credit=amount,
+                    entry_group=group_id,
+                    origin="COMPRA",
+                    origin_id=purchase.id
+                )
+            )
+
+    else:
+
+        purchase_credit_total = round(
+            total - shipping_cost
+            if shipping_is_separate
+            else total,
+            2
+        )
+
+        if purchase_credit_total > 0:
+            db.add(
+                JournalEntry(
+                    date=purchase.date,
+                    concept=f"Compra {purchase.number}",
+                    account_code=payment_code,
+                    account_name=payment_name,
+                    debit=0,
+                    credit=purchase_credit_total,
+                    entry_group=group_id,
+                    origin="COMPRA",
+                    origin_id=purchase.id
+                )
+            )
+
+    if shipping_is_separate:
+        db.add(
+            JournalEntry(
+                date=purchase.date,
+                concept=f"Envío compra {purchase.number}",
+                account_code=shipping_payment_code,
+                account_name=shipping_payment_name,
+                debit=0,
+                credit=round(shipping_cost, 2),
+                entry_group=group_id,
+                origin="COMPRA",
+                origin_id=purchase.id
+            )
+        )
 
     db.flush()
 
-    installments_count = purchase_installments_count(
-        purchase,
-        data
-    )
-
-    if installments_count > 0:
+    if card_purchase and installments_count > 0:
         create_purchase_installments(
             db,
             purchase,
-            total,
+            card_installment_total,
             installments_count
         )
 
