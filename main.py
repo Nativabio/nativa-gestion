@@ -9750,6 +9750,130 @@ def replace_lot_production_journal(
     )
 
 
+@app.get("/reports/costs/raw-materials")
+def get_raw_material_cost_report(
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    raw_material_id: Optional[int] = None,
+    db: Session = Depends(get_db)
+):
+    """Consumo y costo histórico de materias primas utilizadas en lotes."""
+    try:
+        date_from = (
+            datetime.strptime(from_date, "%Y-%m-%d").date()
+            if from_date else None
+        )
+        date_to = (
+            datetime.strptime(to_date, "%Y-%m-%d").date()
+            if to_date else None
+        )
+    except ValueError:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Las fechas deben tener formato YYYY-MM-DD"}
+        )
+
+    if date_from and date_to and date_from > date_to:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "La fecha Desde no puede ser posterior a Hasta"}
+        )
+
+    sql = """
+        SELECT
+            lots.id AS lot_id,
+            lots.lot_number AS lot_number,
+            lots.production_date AS production_date,
+            lot_materials.raw_material_id AS raw_material_id,
+            raw_materials.name AS raw_material_name,
+            raw_materials.unit AS unit,
+            lot_materials.quantity AS quantity,
+            lot_materials.unit_cost AS unit_cost,
+            lot_materials.subtotal_cost AS subtotal_cost,
+            lot_materials.source AS source
+        FROM lot_materials
+        INNER JOIN lots
+            ON lots.id = lot_materials.lot_id
+        LEFT JOIN raw_materials
+            ON raw_materials.id = lot_materials.raw_material_id
+        WHERE (lots.origin = 'PRODUCTION' OR lots.origin IS NULL)
+    """
+    params = {}
+
+    if date_from:
+        sql += " AND lots.production_date >= :date_from"
+        params["date_from"] = date_from
+    if date_to:
+        sql += " AND lots.production_date <= :date_to"
+        params["date_to"] = date_to
+    if raw_material_id:
+        sql += " AND lot_materials.raw_material_id = :raw_material_id"
+        params["raw_material_id"] = raw_material_id
+
+    sql += " ORDER BY raw_materials.name ASC, lots.production_date ASC, lots.id ASC"
+
+    rows = db.execute(text(sql), params).mappings().all()
+    grouped = {}
+
+    for row in rows:
+        material_id = int(row["raw_material_id"])
+        item = grouped.setdefault(material_id, {
+            "raw_material_id": material_id,
+            "name": row["raw_material_name"] or "Materia prima eliminada",
+            "unit": row["unit"] or "",
+            "quantity_used": 0.0,
+            "cost_used": 0.0,
+            "lot_count": 0,
+            "estimated_lot_count": 0,
+            "details": []
+        })
+
+        quantity = float(row["quantity"] or 0)
+        subtotal = float(row["subtotal_cost"] or 0)
+        source = row["source"] or "REAL"
+
+        item["quantity_used"] += quantity
+        item["cost_used"] += subtotal
+        item["lot_count"] += 1
+        if source == "FORMULA_ESTIMATE":
+            item["estimated_lot_count"] += 1
+
+        item["details"].append({
+            "lot_id": int(row["lot_id"]),
+            "lot_number": row["lot_number"] or str(row["lot_id"]),
+            "production_date": (
+                row["production_date"].isoformat()
+                if row["production_date"] else None
+            ),
+            "quantity": quantity,
+            "unit_cost": float(row["unit_cost"] or 0),
+            "subtotal_cost": subtotal,
+            "source": source
+        })
+
+    materials = list(grouped.values())
+    materials.sort(key=lambda item: item["name"].lower())
+
+    for item in materials:
+        item["quantity_used"] = round(item["quantity_used"], 6)
+        item["cost_used"] = round(item["cost_used"], 2)
+        item["details"].sort(key=lambda detail: (
+            detail["production_date"] or "",
+            detail["lot_number"]
+        ))
+
+    return {
+        "from_date": from_date,
+        "to_date": to_date,
+        "raw_material_id": raw_material_id,
+        "materials": materials,
+        "total_cost": round(sum(item["cost_used"] for item in materials), 2),
+        "material_count": len(materials),
+        "detail_count": sum(item["lot_count"] for item in materials),
+        "estimated_detail_count": sum(item["estimated_lot_count"] for item in materials)
+    }
+
+
 @app.get("/lots")
 def get_lots(
     db: Session = Depends(get_db)
