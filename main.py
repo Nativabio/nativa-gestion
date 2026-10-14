@@ -949,6 +949,12 @@ def infer_journal_origin(
         return "PACKAGING"
 
     if normalized.startswith(
+        "devolución de envases"
+    ):
+
+        return "DEVOLUCION_ENVASE"
+
+    if normalized.startswith(
         "costo de venta"
     ):
 
@@ -2907,6 +2913,15 @@ def apply_returned_containers(
             quantity
         )
 
+        # La devolución recupera un envase que vuelve a formar parte
+        # de Materia Prima. Contablemente se revierte el costo que
+        # había quedado reconocido como Costo de Ventas.
+        returned_container_cost = (
+            float(material.cost or 0)
+            *
+            quantity
+        )
+
         db.add(
             SaleReturnedContainer(
                 sale_id=sale.id,
@@ -2914,6 +2929,21 @@ def apply_returned_containers(
                 quantity=quantity
             )
         )
+
+        if returned_container_cost > 0:
+
+            registrar_asiento(
+                db=db,
+                fecha=sale.date,
+                concepto=f"Devolución de envases {sale.number}",
+                debe_codigo="1.2.01",
+                debe_nombre="Materia Prima",
+                haber_codigo="5.1.01",
+                haber_nombre="Costo de Ventas",
+                importe=returned_container_cost,
+                origin="DEVOLUCION_ENVASE",
+                origin_id=sale.id
+            )
 
 
 def restore_returned_containers(
@@ -3267,7 +3297,8 @@ def restore_sale_details(
         JournalEntry.origin.in_([
             "VENTA",
             "CMV",
-            "PACKAGING"
+            "PACKAGING",
+            "DEVOLUCION_ENVASE"
         ])
     ).delete(
         synchronize_session=False
@@ -3278,7 +3309,8 @@ def restore_sale_details(
         JournalEntry.concept.in_([
             f"Venta {sale.number}",
             f"Costo de venta {sale.number}",
-            f"Packaging venta {sale.number}"
+            f"Packaging venta {sale.number}",
+            f"Devolución de envases {sale.number}"
         ])
     ).delete(
         synchronize_session=False
